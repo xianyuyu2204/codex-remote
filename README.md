@@ -149,7 +149,7 @@ pnpm run test:bridge-smoke
 
 ## 来源与致谢
 
-本项目的起点是社区开源项目 [`qq-codex-bridge`](https://github.com/983033995/qq-codex-bridge)，(https://github.com/983033995)。QQ 机器人与 Codex Desktop 之间的桥接思路，以及消息收发、媒体处理、会话与线程管理等基础骨架，都由该项目最早建立。
+本项目的起点是社区开源项目 [`qq-codex-bridge`](https://github.com/983033995/qq-codex-bridge)。QQ 机器人与 Codex Desktop 之间的桥接思路，以及消息收发、媒体处理、会话与线程管理等基础骨架，都由该项目最早建立。
 
 codex-remote 在此基础上重新定位为面向多个聊天入口的本地调度层，新增并重构了 Codex app-server 链路、Turn Manager 状态机、投递重试与恢复、微信文本网关等能力；同时完整保留上游的 MIT 许可与版权声明。
 
