@@ -1,0 +1,72 @@
+{
+  "name": "codex-desktop-orchestrator",
+  "version": "0.0.1",
+  "description": "Orchestrate and command Codex Desktop from QQ and WeChat, with room for Lark and Telegram adapters.",
+  "type": "module",
+  "homepage": "https://github.com/xxloocee/codex-desktop-orchestrator",
+  "bugs": {
+    "url": "https://github.com/xxloocee/codex-desktop-orchestrator/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xxloocee/codex-desktop-orchestrator.git"
+  },
+  "keywords": [
+    "bridge",
+    "cdp",
+    "codex",
+    "codex-desktop",
+    "electron",
+    "lark",
+    "orchestrator",
+    "qq",
+    "qq-bot",
+    "telegram",
+    "weixin",
+    "typescript"
+  ],
+  "bin": {
+    "codex-desktop-orchestrator": "bin/codex-desktop-orchestrator.js",
+    "codex-desktop-weixin-gateway": "bin/codex-desktop-weixin-gateway.js"
+  },
+  "files": [
+    "bin",
+    "dist/apps",
+    "dist/packages",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx --env-file=.env apps/bridge-daemon/src/dev.ts",
+    "weixin:login": "tsx --env-file=.env apps/weixin-gateway/src/dev.ts -- --weixin-login",
+    "weixin:login:force": "tsx --env-file=.env apps/weixin-gateway/src/dev.ts -- --weixin-login-force",
+    "weixin:logout": "tsx --env-file=.env apps/weixin-gateway/src/dev.ts -- --weixin-logout",
+    "start": "node dist/apps/bridge-daemon/src/cli.js",
+    "start:weixin-gateway": "node dist/apps/weixin-gateway/src/cli.js",
+    "debug:codex-workers": "tsx apps/bridge-daemon/src/debug-codex-workers.ts",
+    "test": "vitest run",
+    "test:offline": "vitest run tests/e2e/qq-offline-smoke.e2e.test.ts",
+    "test:bridge-smoke": "npm run build && node scripts/smoke-bridge.mjs",
+    "test:watch": "vitest",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "prepare-release": "pnpm run build && npm pack --dry-run",
+    "prepublishOnly": "pnpm run build"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  }
+}

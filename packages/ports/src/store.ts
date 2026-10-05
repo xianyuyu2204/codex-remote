@@ -1,0 +1,123 @@
+import type { BridgeSession, BridgeSessionStatus, ConversationProviderKind } from "../../domain/src/session.js";
+import type {
+  ConversationEntry,
+  DeliveryJobRecord,
+  DeliveryJobStatus,
+  InboundMessage,
+  OutboundDraft,
+  ToolEventStatus,
+  TurnEventType
+} from "../../domain/src/message.js";
+import type {
+  BridgeTurnEventRecord,
+  BridgeTurnRecord,
+  BridgeTurnStatus,
+  CreateBridgeTurn
+} from "../../domain/src/turn.js";
+
+export interface SessionStorePort {
+  getSession(sessionKey: string): Promise<BridgeSession | null>;
+  createSession(session: BridgeSession): Promise<void>;
+  updateSessionStatus(
+    sessionKey: string,
+    status: BridgeSessionStatus,
+    lastError?: string | null
+  ): Promise<void>;
+  updateBinding(sessionKey: string, codexThreadRef: string | null): Promise<void>;
+  updateLastCodexTurnId(sessionKey: string, lastCodexTurnId: string | null): Promise<void>;
+  updateSkillContextKey(sessionKey: string, skillContextKey: string | null): Promise<void>;
+  updateConversationProvider(sessionKey: string, provider: ConversationProviderKind | null): Promise<void>;
+  withSessionLock<T>(sessionKey: string, work: () => Promise<T>): Promise<T>;
+}
+
+export interface TranscriptStorePort {
+  recordInbound(message: InboundMessage): Promise<void>;
+  recordOutbound(draft: OutboundDraft): Promise<void>;
+  hasInbound(messageId: string): Promise<boolean>;
+  getInbound?(messageId: string): Promise<InboundMessage | null>;
+  listRecentConversation(sessionKey: string, limit: number): Promise<ConversationEntry[]>;
+}
+
+export interface TurnStorePort {
+  createTurn(turn: CreateBridgeTurn): Promise<void>;
+  attachCodexTurn(turnId: string, codexTurnRef: string): Promise<void>;
+  updateCodexThreadRef(turnId: string, codexThreadRef: string | null): Promise<void>;
+  updateStatus(
+    turnId: string,
+    status: BridgeTurnStatus,
+    lastError?: string | null,
+    updatedAt?: string
+  ): Promise<void>;
+  markRunningIfActive?(
+    turnId: string,
+    deadlineAt: string | null,
+    preserveDeadline?: boolean
+  ): Promise<boolean>;
+  markQueuedIfActive?(turnId: string, preserveDeadline?: boolean): Promise<boolean>;
+  markStreamingIfActive?(
+    turnId: string,
+    codexTurnRef: string,
+    eventAt: string
+  ): Promise<boolean>;
+  markTerminalIfActive?(
+    turnId: string,
+    status: BridgeTurnStatus,
+    lastError?: string | null
+  ): Promise<boolean>;
+  updateDeadline(turnId: string, deadlineAt: string | null): Promise<void>;
+  recordTurnEvent(input: {
+    sessionKey: string;
+    codexTurnRef: string;
+    qqMessageId?: string | null;
+    status: BridgeTurnStatus;
+    eventAt: string;
+    eventType?: TurnEventType;
+    lastToolName?: string | null;
+    toolStatus?: ToolEventStatus | null;
+    summary?: string | null;
+    lastError?: string | null;
+  }): Promise<void>;
+  addDeliveredText(turnId: string, textLength: number): Promise<void>;
+  getCurrentTurn(sessionKey: string): Promise<BridgeTurnRecord | null>;
+  getTurn(turnId: string): Promise<BridgeTurnRecord | null>;
+  getTurnByCodexTurn(
+    sessionKey: string,
+    codexTurnRef: string,
+    qqMessageId?: string | null
+  ): Promise<BridgeTurnRecord | null>;
+  listRecentTurns(sessionKey: string, limit: number): Promise<BridgeTurnRecord[]>;
+  listTurnEvents?(turnId: string, limit: number): Promise<BridgeTurnEventRecord[]>;
+}
+
+export interface ThreadLockStorePort {
+  withThreadLock<T>(
+    threadRef: string,
+    work: () => Promise<T>,
+    options?: { onQueued?: () => Promise<void> }
+  ): Promise<T>;
+}
+
+export interface DeliveryJobStorePort {
+  claimDueJobs(input: {
+    limit: number;
+    now: string;
+  }): Promise<DeliveryJobRecord[]>;
+  markDelivered(input: {
+    jobId: string;
+    deliveredAt: string;
+    providerMessageId?: string | null;
+  }): Promise<void>;
+  markAttemptFailed(input: {
+    jobId: string;
+    failedAt: string;
+    error: string;
+    maxAttempts: number;
+    retryAfterMs: number;
+  }): Promise<void>;
+  recoverInFlight(now: string): Promise<number>;
+  listJobs(input: {
+    sessionKey: string;
+    statuses?: DeliveryJobStatus[];
+    limit: number;
+  }): Promise<DeliveryJobRecord[]>;
+}

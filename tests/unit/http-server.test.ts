@@ -1,0 +1,264 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  createBridgeHttpServer,
+  createInternalTurnEventServer
+} from "../../apps/bridge-daemon/src/http-server.js";
+import { TurnEventType } from "../../packages/domain/src/message.js";
+
+describe("internal turn event server", () => {
+  const servers: Array<{ close: () => void }> = [];
+
+  afterEach(() => {
+    while (servers.length > 0) {
+      servers.pop()?.close();
+    }
+  });
+
+  it("accepts codex turn events on the internal route", async () => {
+    const payloads: unknown[] = [];
+    const server = createInternalTurnEventServer({
+      routePath: "/internal/codex-turn-events",
+      ingress: {
+        dispatchTurnEvent: async (payload) => {
+          payloads.push(payload);
+        }
+      }
+    });
+    servers.push(server);
+
+    const response = await new Promise<{ statusCode: number }>((resolve) => {
+      server.emit(
+        "request",
+        {
+          method: "POST",
+          url: "/internal/codex-turn-events",
+          socket: { remoteAddress: "127.0.0.1" },
+          [Symbol.asyncIterator]: async function* () {
+            yield Buffer.from(
+              JSON.stringify({
+                sessionKey: "qqbot:default::qq:c2c:abc-123",
+                turnId: "turn-1",
+                sequence: 1,
+                eventType: TurnEventType.Completed,
+                createdAt: "2026-04-12T12:00:00.000Z",
+                isFinal: true,
+                payload: {
+                  fullText: "完整结果",
+                  completionReason: "stable"
+                }
+              })
+            );
+          }
+        } as never,
+        {
+          statusCode: 200,
+          end: function () {
+            resolve({ statusCode: this.statusCode });
+          }
+        }
+      );
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(payloads).toHaveLength(1);
+  });
+
+  it("rejects non-local callers", async () => {
+    const server = createInternalTurnEventServer({
+      routePath: "/internal/codex-turn-events",
+      ingress: {
+        dispatchTurnEvent: vi.fn()
+      }
+    });
+    servers.push(server);
+
+    const response = await new Promise<{ statusCode: number }>((resolve) => {
+      server.emit(
+        "request",
+        {
+          method: "POST",
+          url: "/internal/codex-turn-events",
+          socket: { remoteAddress: "10.0.0.8" },
+          [Symbol.asyncIterator]: async function* () {
+            yield Buffer.from("{}");
+          }
+        },
+        {
+          statusCode: 200,
+          end: function () {
+            resolve({ statusCode: this.statusCode });
+          }
+        }
+      );
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
+  it("supports multiple json routes in one bridge http server", async () => {
+    const payloads: unknown[] = [];
+    const server = createBridgeHttpServer([
+      {
+        routePath: "/internal/codex-turn-events",
+        allowOnlyLocal: true,
+        dispatchPayload: async (payload) => {
+          payloads.push({ route: "internal", payload });
+        }
+      },
+      {
+        routePath: "/webhooks/weixin",
+        dispatchPayload: async (payload) => {
+          payloads.push({ route: "weixin", payload });
+        }
+      }
+    ]);
+    servers.push(server);
+
+    const response = await new Promise<{ statusCode: number }>((resolve) => {
+      server.emit(
+        "request",
+        {
+          method: "POST",
+          url: "/webhooks/weixin",
+          socket: { remoteAddress: "10.0.0.8" },
+          [Symbol.asyncIterator]: async function* () {
+            yield Buffer.from(JSON.stringify({ text: "hello" }));
+          }
+        } as never,
+        {
+          statusCode: 200,
+          end: function () {
+            resolve({ statusCode: this.statusCode });
+          }
+        }
+      );
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(payloads).toEqual([{ route: "weixin", payload: { text: "hello" } }]);
+  });
+
+  it("serves authenticated local get json routes", async () => {
+    const server = createBridgeHttpServer([
+      {
+        routePath: "/status",
+        method: "GET",
+        allowOnlyLocal: true,
+        requiredToken: "secret-token",
+        dispatchPayload: async () => ({ ok: true })
+      }
+    ]);
+    servers.push(server);
+
+    const response = await new Promise<{ statusCode: number; body: string }>((resolve) => {
+      server.emit(
+        "request",
+        {
+          method: "GET",
+          url: "/status",
+          headers: { "x-qq-codex-token": "secret-token" },
+          socket: { remoteAddress: "127.0.0.1" },
+          [Symbol.asyncIterator]: async function* () {}
+        } as never,
+        {
+          statusCode: 200,
+          setHeader: vi.fn(),
+          end: function (body = "") {
+            resolve({ statusCode: this.statusCode, body });
+          }
+        }
+      );
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({ ok: true });
+  });
+
+  it("rejects get json routes with an invalid token", async () => {
+    const server = createBridgeHttpServer([
+      {
+        routePath: "/status",
+        method: "GET",
+        allowOnlyLocal: true,
+        requiredToken: "secret-token",
+        dispatchPayload: async () => ({ ok: true })
+      }
+    ]);
+    servers.push(server);
+
+    const response = await new Promise<{ statusCode: number }>((resolve) => {
+      server.emit(
+        "request",
+        {
+          method: "GET",
+          url: "/status",
+          headers: { "x-qq-codex-token": "wrong" },
+          socket: { remoteAddress: "127.0.0.1" },
+          [Symbol.asyncIterator]: async function* () {}
+        } as never,
+        {
+          statusCode: 200,
+          end: function () {
+            resolve({ statusCode: this.statusCode });
+          }
+        }
+      );
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it("serves synchronous json write routes on the same path as get routes", async () => {
+    const payloads: unknown[] = [];
+    const server = createBridgeHttpServer([
+      {
+        routePath: "/config",
+        method: "GET",
+        allowOnlyLocal: true,
+        requiredToken: "secret-token",
+        dispatchPayload: async () => ({ mode: "read" })
+      },
+      {
+        routePath: "/config",
+        method: "PUT",
+        allowOnlyLocal: true,
+        requiredToken: "secret-token",
+        respondWithJson: true,
+        dispatchPayload: async (payload) => {
+          payloads.push(payload);
+          return { mode: "updated", payload };
+        }
+      }
+    ]);
+    servers.push(server);
+
+    const response = await new Promise<{ statusCode: number; body: string }>((resolve) => {
+      server.emit(
+        "request",
+        {
+          method: "PUT",
+          url: "/config",
+          headers: { authorization: "Bearer secret-token" },
+          socket: { remoteAddress: "127.0.0.1" },
+          [Symbol.asyncIterator]: async function* () {
+            yield Buffer.from(JSON.stringify({ runtime: { listenPort: 3999 } }));
+          }
+        } as never,
+        {
+          statusCode: 200,
+          setHeader: vi.fn(),
+          end: function (body = "") {
+            resolve({ statusCode: this.statusCode, body });
+          }
+        }
+      );
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      mode: "updated",
+      payload: { runtime: { listenPort: 3999 } }
+    });
+    expect(payloads).toEqual([{ runtime: { listenPort: 3999 } }]);
+  });
+});

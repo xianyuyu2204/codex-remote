@@ -1,0 +1,284 @@
+import { describe, expect, it, vi, afterEach } from "vitest";
+import { DesktopDriverError } from "../../packages/domain/src/driver.js";
+import type { DeliveryRecord, InboundMessage, TurnEvent } from "../../packages/domain/src/message.js";
+import { createIngressMessageHandler, resolveTurnEventOrchestrator } from "../../apps/bridge-daemon/src/main.js";
+
+function createMessage(overrides: Partial<InboundMessage> = {}): InboundMessage {
+  return {
+    messageId: "msg-main-1",
+    accountKey: "qqbot:default",
+    sessionKey: "qqbot:default::qq:c2c:abc-123",
+    peerKey: "qq:c2c:abc-123",
+    chatType: "c2c",
+    senderId: "abc-123",
+    text: "hello",
+    receivedAt: "2026-04-09T12:00:00.000Z",
+    ...overrides
+  };
+}
+
+function createDeliveryRecord(draftId: string): DeliveryRecord {
+  return {
+    jobId: draftId,
+    sessionKey: "qqbot:default::qq:c2c:abc-123",
+    providerMessageId: "provider-msg-1",
+    deliveredAt: "2026-04-09T12:00:01.000Z"
+  };
+}
+
+describe("bridge daemon main", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("routes normal inbound messages to the orchestrator", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockResolvedValue(undefined)
+    };
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator
+    });
+
+    const message = createMessage();
+    await handler(message);
+
+    expect(threadCommandHandler.handleIfCommand).toHaveBeenCalledWith(message);
+    expect(orchestrator.handleInbound).toHaveBeenCalledWith(message);
+  });
+
+  it("logs inbound turn failures without rethrowing them", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(new Error("Codex desktop reply did not arrive before timeout"))
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator
+    });
+
+    await expect(handler(createMessage())).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[codex-desktop-orchestrator] message handling failed",
+      expect.objectContaining({
+        messageId: "msg-main-1",
+        sessionKey: "qqbot:default::qq:c2c:abc-123",
+        error: "Codex desktop reply did not arrive before timeout"
+      })
+    );
+  });
+
+  it("sends a visible bridge error reply when inbound handling fails", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(new Error("Codex app-server turn failed"))
+    };
+    const errorEgress = {
+      deliver: vi.fn(async (draft) => createDeliveryRecord(draft.draftId))
+    };
+    const transcriptStore = {
+      recordOutbound: vi.fn().mockResolvedValue(undefined)
+    };
+    const deliveryJobStore = {
+      claimDueJobs: vi.fn().mockResolvedValue([]),
+      markDelivered: vi.fn().mockResolvedValue(undefined),
+      markAttemptFailed: vi.fn().mockResolvedValue(undefined),
+      recoverInFlight: vi.fn().mockResolvedValue(0),
+      listJobs: vi.fn().mockResolvedValue([])
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator,
+      errorEgress,
+      transcriptStore,
+      deliveryJobStore
+    });
+
+    await expect(handler(createMessage({
+      messageId: "retry:internal-1",
+      replyToMessageId: "msg-main-1"
+    }))).resolves.toBeUndefined();
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "qqbot:default::qq:c2c:abc-123",
+        replyToMessageId: "msg-main-1",
+        text: "[bridge error] Codex app-server turn failed"
+      })
+    );
+    expect(transcriptStore.recordOutbound).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "[bridge error] Codex app-server turn failed",
+        replyToMessageId: "msg-main-1"
+      })
+    );
+    expect(deliveryJobStore.markDelivered).toHaveBeenCalledWith({
+      jobId: expect.any(String),
+      deliveredAt: "2026-04-09T12:00:01.000Z",
+      providerMessageId: "provider-msg-1"
+    });
+  });
+
+  it("sends an actionable reply when the bound Codex thread exceeds the context window", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(
+        new DesktopDriverError("Codex app-server turn failed: context_length_exceeded", "context_length_exceeded")
+      )
+    };
+    const errorEgress = {
+      deliver: vi.fn(async (draft) => createDeliveryRecord(draft.draftId))
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator,
+      errorEgress
+    });
+
+    await expect(handler(createMessage())).resolves.toBeUndefined();
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "qqbot:default::qq:c2c:abc-123",
+        replyToMessageId: "msg-main-1",
+        text: expect.stringContaining("Current Codex thread exceeds the model context window")
+      })
+    );
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("/tn <title>")
+      })
+    );
+  });
+
+  it("sends a compact bridge error reply for Codex service input validation failures", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(
+        new DesktopDriverError("Codex app-server turn failed: service_error", "service_error")
+      )
+    };
+    const errorEgress = {
+      deliver: vi.fn(async (draft) => createDeliveryRecord(draft.draftId))
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator,
+      errorEgress
+    });
+
+    await expect(handler(createMessage())).resolves.toBeUndefined();
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyToMessageId: "msg-main-1",
+        text: expect.stringContaining("Codex rejected this message input")
+      })
+    );
+  });
+
+  it("drops unauthorized inbound messages before command or orchestrator handling", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockResolvedValue(undefined)
+    };
+    const onRejected = vi.fn();
+
+    const handler = createIngressMessageHandler({
+      accessControl: {
+        mode: "deny-by-default",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      onRejected,
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator
+    });
+
+    const message = createMessage();
+    await handler(message);
+
+    expect(onRejected).toHaveBeenCalledWith(
+      message,
+      expect.objectContaining({
+        allowed: false,
+        reason: "c2c_sender_not_allowed"
+      })
+    );
+    expect(threadCommandHandler.handleIfCommand).not.toHaveBeenCalled();
+    expect(orchestrator.handleInbound).not.toHaveBeenCalled();
+  });
+
+  it("routes turn events to the matching channel orchestrator based on session key", () => {
+    const qq = { handleTurnEvent: vi.fn() };
+    const weixin = { handleTurnEvent: vi.fn() };
+    const event: TurnEvent = {
+      sessionKey: "weixin:default::wx:c2c:wxid-1",
+      turnId: "turn-1",
+      sequence: 2,
+      eventType: "turn.completed" as TurnEvent["eventType"],
+      createdAt: "2026-04-15T03:30:00.000Z",
+      isFinal: true,
+      payload: {
+        fullText: "<qqmedia>/tmp/demo.jpg</qqmedia>"
+      }
+    };
+
+    const resolved = resolveTurnEventOrchestrator(event, {
+      qq,
+      weixin
+    });
+
+    expect(resolved).toBe(weixin);
+  });
+
+  it("routes turn events to the exact account orchestrator when multiple accounts are registered", () => {
+    const qq = { handleTurnEvent: vi.fn() };
+    const qqShop = { handleTurnEvent: vi.fn() };
+    const weixinMain = { handleTurnEvent: vi.fn() };
+    const event: TurnEvent = {
+      sessionKey: "qqbot:shop::qq:c2c:openid-1",
+      turnId: "turn-accounts-1",
+      sequence: 1,
+      eventType: "turn.completed" as TurnEvent["eventType"],
+      createdAt: "2026-04-26T12:00:00.000Z",
+      isFinal: true,
+      payload: {
+        fullText: "ok"
+      }
+    };
+
+    const resolved = resolveTurnEventOrchestrator(event, {
+      qq,
+      byAccountKey: {
+        "qqbot:shop": qqShop,
+        "weixin:main": weixinMain
+      }
+    });
+
+    expect(resolved).toBe(qqShop);
+  });
+});

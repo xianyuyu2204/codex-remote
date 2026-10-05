@@ -1,0 +1,2811 @@
+import { randomUUID } from "node:crypto";
+import {
+  type CodexControlState,
+  DesktopDriverError,
+  type CodexThreadSummary,
+  type DriverBinding
+} from "../../../domain/src/driver.js";
+import {
+  MediaArtifactKind,
+  type InboundMessage,
+  type MediaArtifact,
+  type OutboundDraft,
+  TurnEventType,
+  type TurnEventPayload
+} from "../../../domain/src/message.js";
+import type {
+  ConversationRunOptions,
+  DesktopDriverPort
+} from "../../../ports/src/conversation.js";
+import { CdpSession } from "./cdp-session.js";
+import {
+  CodexLocalRolloutReader,
+  type CodexLocalRolloutCursor,
+  type CodexLocalRolloutTurnResult
+} from "./codex-local-rollout-reader.js";
+import {
+  type CodexLocalSubmissionCursor,
+  type CodexLocalSubmissionResult
+} from "./codex-local-submission-reader.js";
+import { isLikelyComposerSubmitButton } from "./composer-heuristics.js";
+import { parseAssistantReply } from "./reply-parser.js";
+
+const TARGET_REF_PREFIX = "cdp-target:";
+const THREAD_REF_PREFIX = "codex-thread:";
+
+type RawSidebarThread = {
+  title: string;
+  projectName: string | null;
+  relativeTime: string | null;
+  isCurrent: boolean;
+};
+
+type ThreadLocator = {
+  pageId: string;
+  title: string;
+  projectName: string | null;
+};
+
+type AssistantReplySnapshot = {
+  unitKey: string | null;
+  reply: string | null;
+  mediaReferences: string[];
+  isStreaming: boolean;
+};
+
+type ConversationViewportFingerprint = {
+  latestUnitKey: string | null;
+  latestSnippet: string | null;
+  unitCount: number;
+};
+
+type CodexDesktopDriverOptions = {
+  replyPollAttempts?: number;
+  maxReplyPollAttempts?: number;
+  replyPollIntervalMs?: number;
+  replyStablePolls?: number;
+  partialReplyStablePolls?: number;
+  composerSubmitPollIntervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  localRolloutReader?: {
+    captureCursorForThreadTitle(title: string): CodexLocalRolloutCursor | null;
+    waitForTurnCompletion(
+      cursor: CodexLocalRolloutCursor,
+      options: { pollAttempts: number; pollIntervalMs: number }
+    ): Promise<CodexLocalRolloutTurnResult | null>;
+  } | null;
+  localSubmissionReader?: {
+    captureCursorForThreadId(threadId: string): CodexLocalSubmissionCursor | null;
+    waitForTurnSubmission(
+      cursor: CodexLocalSubmissionCursor,
+      options: { pollAttempts: number; pollIntervalMs: number }
+    ): Promise<CodexLocalSubmissionResult>;
+  } | null;
+};
+
+export class CodexDesktopDriver implements DesktopDriverPort {
+  private readonly replyPollAttempts: number;
+  private readonly maxReplyPollAttempts: number;
+  private readonly replyPollIntervalMs: number;
+  private readonly replyStablePolls: number;
+  private readonly partialReplyStablePolls: number;
+  private readonly composerSubmitPollIntervalMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly localRolloutReader: CodexDesktopDriverOptions["localRolloutReader"];
+  private readonly localSubmissionReader: CodexDesktopDriverOptions["localSubmissionReader"];
+  private readonly pendingReplyBaselines = new Map<string, AssistantReplySnapshot>();
+  private readonly pendingLocalRolloutCursors = new Map<string, CodexLocalRolloutCursor>();
+  private readonly activeTargetIdsBySession = new Map<string, string>();
+
+  constructor(
+    private readonly cdp: CdpSession,
+    options: CodexDesktopDriverOptions = {}
+  ) {
+    this.replyPollAttempts = Math.max(1, options.replyPollAttempts ?? 60);
+    this.maxReplyPollAttempts = Math.max(
+      this.replyPollAttempts,
+      options.maxReplyPollAttempts ?? this.replyPollAttempts * 10
+    );
+    this.replyPollIntervalMs = options.replyPollIntervalMs ?? 500;
+    this.replyStablePolls = Math.max(1, options.replyStablePolls ?? 3);
+    this.partialReplyStablePolls = Math.max(1, options.partialReplyStablePolls ?? 2);
+    this.composerSubmitPollIntervalMs = Math.max(50, options.composerSubmitPollIntervalMs ?? 300);
+    this.sleep =
+      options.sleep ??
+      ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    this.localRolloutReader = options.localRolloutReader ?? null;
+    this.localSubmissionReader = options.localSubmissionReader ?? null;
+  }
+
+  async ensureAppReady(): Promise<void> {
+    await this.cdp.connect();
+    const targets = await this.cdp.listTargets();
+    const hasPageTarget = targets.some((target) => target.type === "page");
+
+    if (!hasPageTarget) {
+      throw new DesktopDriverError(
+        "Codex desktop app is not exposing any inspectable page target",
+        "app_not_ready"
+      );
+    }
+  }
+
+  async interruptActiveTurn(sessionKey: string): Promise<boolean> {
+    const targetId = this.activeTargetIdsBySession.get(sessionKey)
+      ?? (await this.resolvePageTarget()).id;
+    const result = (await this.cdp.evaluateOnPage(
+      this.buildInterruptActiveTurnScript(),
+      targetId
+    )) as { interrupted?: boolean } | undefined;
+    return result?.interrupted === true;
+  }
+
+  async getControlState(): Promise<CodexControlState> {
+    const pageTarget = await this.resolvePageTarget();
+    const state = (await this.cdp.evaluateOnPage(
+      this.buildReadControlStateScript(),
+      pageTarget.id
+    )) as CodexControlState | null;
+
+    return (
+      state ?? {
+        model: null,
+        reasoningEffort: null,
+        workspace: null,
+        branch: null,
+        permissionMode: null,
+        quotaSummary: null
+      }
+    );
+  }
+
+  async getQuotaSummary(): Promise<string | null> {
+    const pageTarget = await this.resolvePageTarget();
+    const quotaSummary = (await this.cdp.evaluateOnPage(
+      this.buildReadQuotaSummaryScript(),
+      pageTarget.id
+    )) as string | null | undefined;
+
+    return quotaSummary ?? null;
+  }
+
+  async switchModel(model: string): Promise<CodexControlState> {
+    const pageTarget = await this.resolvePageTarget();
+    const result = (await this.cdp.evaluateOnPage(
+      this.buildSwitchModelScript(model),
+      pageTarget.id
+    )) as { ok?: boolean; reason?: string } | undefined;
+
+    if (!result?.ok) {
+      throw new DesktopDriverError(
+        `Codex desktop model switch failed: ${result?.reason ?? "unknown"}`,
+        "control_not_found"
+      );
+    }
+
+    await this.sleep(300);
+    return this.getControlState();
+  }
+
+  async openOrBindSession(
+    sessionKey: string,
+    binding: DriverBinding | null
+  ): Promise<DriverBinding> {
+    const pageTarget = await this.resolvePageTarget();
+    const pageId = pageTarget.id;
+
+    if (binding?.codexThreadRef === `${TARGET_REF_PREFIX}${pageId}`) {
+      return binding;
+    }
+
+    if (binding?.codexThreadRef?.startsWith(THREAD_REF_PREFIX)) {
+      const locator = this.decodeThreadRef(binding.codexThreadRef);
+      if (locator && locator.pageId === pageId) {
+        const threads = await this.listRecentThreads(200);
+        const matched = threads.find((thread) => thread.threadRef === binding.codexThreadRef);
+        if (matched) {
+          return binding;
+        }
+      }
+    }
+
+    const currentThread = (await this.listRecentThreads(200)).find((thread) => thread.isCurrent);
+    if (currentThread) {
+      return {
+        sessionKey,
+        codexThreadRef: currentThread.threadRef
+      };
+    }
+
+    return {
+      sessionKey,
+      codexThreadRef: `${TARGET_REF_PREFIX}${pageId}`
+    };
+  }
+
+  async listRecentThreads(limit: number): Promise<CodexThreadSummary[]> {
+    const pageTarget = await this.resolvePageTarget();
+    const rawThreads = (await this.cdp.evaluateOnPage(
+      this.buildThreadListScript(),
+      pageTarget.id
+    )) as RawSidebarThread[] | null;
+
+    if (!Array.isArray(rawThreads)) {
+      return [];
+    }
+
+    return rawThreads
+      .sort((left, right) => this.compareThreadActivity(left, right))
+      .slice(0, limit)
+      .map((thread, index) => ({
+      index: index + 1,
+      title: thread.title,
+      projectName: thread.projectName,
+      relativeTime: thread.relativeTime,
+      isCurrent: thread.isCurrent,
+      threadRef: this.encodeThreadRef({
+        pageId: pageTarget.id,
+        title: thread.title,
+        projectName: thread.projectName
+      })
+      }));
+  }
+
+  async switchToThread(sessionKey: string, threadRef: string): Promise<DriverBinding> {
+    const locator = this.decodeThreadRef(threadRef);
+    if (!locator) {
+      throw new DesktopDriverError("Codex thread binding is invalid", "session_not_found");
+    }
+
+    const result = (await this.cdp.evaluateOnPage(
+      this.buildSelectThreadScript(locator),
+      locator.pageId
+    )) as { ok?: boolean; reason?: string } | undefined;
+
+    if (!result?.ok) {
+      throw new DesktopDriverError(
+        `Codex desktop thread switch failed: ${result?.reason ?? "unknown"}`,
+        "session_not_found"
+      );
+    }
+
+    return {
+      sessionKey,
+      codexThreadRef: threadRef
+    };
+  }
+
+  async createThread(sessionKey: string, seedPrompt: string): Promise<DriverBinding> {
+    const pageTarget = await this.resolvePageTarget();
+    const clickResult = (await this.cdp.evaluateOnPage(
+      this.buildNewThreadScript(),
+      pageTarget.id
+    )) as { ok?: boolean; reason?: string } | undefined;
+
+    if (!clickResult?.ok) {
+      throw new DesktopDriverError(
+        `Codex desktop new thread failed: ${clickResult?.reason ?? "unknown"}`,
+        "session_not_found"
+      );
+    }
+
+    await this.waitForFreshThreadContext(pageTarget.id);
+
+    const temporaryBinding: DriverBinding = {
+      sessionKey,
+      codexThreadRef: `${TARGET_REF_PREFIX}${pageTarget.id}`
+    };
+
+    if (seedPrompt.trim()) {
+      await this.sendUserMessage(temporaryBinding, {
+        messageId: `thread-seed:${randomUUID()}`,
+        accountKey: "qqbot:default",
+        sessionKey,
+        peerKey: "qq:c2c:thread-control",
+        chatType: "c2c",
+        senderId: "thread-control",
+        text: seedPrompt,
+        receivedAt: new Date().toISOString()
+      });
+    }
+
+    return temporaryBinding;
+  }
+
+  async sendUserMessage(binding: DriverBinding, message: InboundMessage): Promise<void> {
+    const targetId = await this.ensureThreadSelected(binding);
+    this.activeTargetIdsBySession.set(binding.sessionKey, targetId);
+    const baselineReply = await this.readLatestAssistantSnapshot(targetId);
+    this.pendingReplyBaselines.set(binding.sessionKey, baselineReply);
+    await this.capturePendingLocalRolloutCursor(binding);
+    const submissionCursor = this.capturePendingLocalSubmissionCursor(binding);
+
+    const focusResult = (await this.cdp.evaluateOnPage(
+      this.buildFocusComposerScript(),
+      targetId
+    )) as { ok?: boolean; reason?: string } | undefined;
+
+    if (!focusResult?.ok) {
+      this.activeTargetIdsBySession.delete(binding.sessionKey);
+      this.pendingReplyBaselines.delete(binding.sessionKey);
+      this.pendingLocalRolloutCursors.delete(binding.sessionKey);
+      throw new DesktopDriverError(
+        `Codex desktop input box not found: ${focusResult?.reason ?? "unknown"}`,
+        "input_not_found"
+      );
+    }
+
+    await this.cdp.dispatchKeyEvent(
+      {
+        type: "keyDown",
+        commands: ["selectAll"]
+      },
+      targetId
+    );
+    await this.cdp.dispatchKeyEvent(
+      {
+        type: "keyDown",
+        key: "Backspace",
+        code: "Backspace",
+        windowsVirtualKeyCode: 8,
+        nativeVirtualKeyCode: 8
+      },
+      targetId
+    );
+    await this.cdp.dispatchKeyEvent(
+      {
+        type: "keyUp",
+        key: "Backspace",
+        code: "Backspace",
+        windowsVirtualKeyCode: 8,
+        nativeVirtualKeyCode: 8
+      },
+      targetId
+    );
+    await this.cdp.insertText(message.text, targetId);
+
+    const result = (await this.cdp.evaluateOnPage(
+      this.buildSubmitComposerScript(),
+      targetId
+    )) as { ok?: boolean; reason?: string } | undefined;
+
+    if (result?.ok && !submissionCursor) {
+      return;
+    }
+
+    const confirmedAfterInitialSubmit = await this.waitForSubmissionConfirmation(
+      binding.sessionKey,
+      targetId,
+      submissionCursor,
+      4
+    );
+    if (confirmedAfterInitialSubmit.submitted) {
+      return;
+    }
+
+    console.warn("[codex-desktop-orchestrator] codex composer submit not yet confirmed", {
+      sessionKey: binding.sessionKey,
+      messageId: message.messageId,
+      targetId,
+      initialResult: result ?? null,
+      confirmedAfterInitialSubmit
+    });
+
+    await this.cdp.dispatchKeyEvent(
+      {
+        type: "keyDown",
+        key: "Enter",
+        code: "Enter",
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13
+      },
+      targetId
+    );
+    await this.cdp.dispatchKeyEvent(
+      {
+        type: "keyUp",
+        key: "Enter",
+        code: "Enter",
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13
+      },
+      targetId
+    );
+
+    const retryResult = await this.waitForSubmissionConfirmation(
+      binding.sessionKey,
+      targetId,
+      submissionCursor,
+      4
+    );
+
+    if (retryResult?.submitted) {
+      return;
+    }
+
+    this.pendingReplyBaselines.delete(binding.sessionKey);
+    this.pendingLocalRolloutCursors.delete(binding.sessionKey);
+    this.activeTargetIdsBySession.delete(binding.sessionKey);
+    console.error("[codex-desktop-orchestrator] codex composer submit failed", {
+      sessionKey: binding.sessionKey,
+      messageId: message.messageId,
+      targetId,
+      initialResult: result ?? null,
+      confirmedAfterInitialSubmit,
+      retryResult
+    });
+    throw new DesktopDriverError(
+      `Codex desktop composer submit failed: ${retryResult?.reason ?? result?.reason ?? "unknown"}`,
+      "submit_failed"
+    );
+  }
+
+  private async waitForSubmissionConfirmation(
+    sessionKey: string,
+    targetId: string,
+    submissionCursor: CodexLocalSubmissionCursor | null,
+    attempts: number
+  ): Promise<{ submitted?: boolean; reason?: string; turnId?: string | null }> {
+    if (submissionCursor && this.localSubmissionReader) {
+      const result = await this.localSubmissionReader.waitForTurnSubmission(submissionCursor, {
+        pollAttempts: attempts,
+        pollIntervalMs: this.composerSubmitPollIntervalMs
+      });
+      if (result.submitted) {
+        this.attachPendingTurnId(sessionKey, result.turnId);
+      }
+      return result;
+    }
+
+    return this.waitForComposerSubmission(targetId, attempts);
+  }
+
+  private async waitForComposerSubmission(
+    targetId: string,
+    attempts: number
+  ): Promise<{ submitted?: boolean; reason?: string }> {
+    let lastResult: { submitted?: boolean; reason?: string } | undefined;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      lastResult = (await this.cdp.evaluateOnPage(
+        this.buildComposerSubmissionStateScript(),
+        targetId
+      )) as { submitted?: boolean; reason?: string } | undefined;
+
+      if (lastResult?.submitted) {
+        return lastResult;
+      }
+
+      if (attempt + 1 < attempts) {
+        await this.sleep(this.composerSubmitPollIntervalMs);
+      }
+    }
+
+    return lastResult ?? { submitted: false, reason: "submit_not_confirmed" };
+  }
+
+  async collectAssistantReply(
+    binding: DriverBinding,
+    options: ConversationRunOptions = {}
+  ): Promise<OutboundDraft[]> {
+    try {
+      return await this.collectAssistantReplyInternal(binding, options);
+    } finally {
+      this.activeTargetIdsBySession.delete(binding.sessionKey);
+    }
+  }
+
+  private async collectAssistantReplyInternal(
+    binding: DriverBinding,
+    options: ConversationRunOptions
+  ): Promise<OutboundDraft[]> {
+    const localCursor =
+      this.pendingLocalRolloutCursors.get(binding.sessionKey)
+      ?? this.captureAdHocLocalRolloutCursor(binding);
+    if (localCursor) {
+      const localReply = await this.localRolloutReader?.waitForTurnCompletion(localCursor, {
+        pollAttempts: this.maxReplyPollAttempts,
+        pollIntervalMs: this.replyPollIntervalMs
+      });
+      this.pendingLocalRolloutCursors.delete(binding.sessionKey);
+      if (localReply) {
+        this.pendingReplyBaselines.delete(binding.sessionKey);
+        return this.collectAssistantReplyFromLocalRollout(binding, localReply, options);
+      }
+    }
+
+    const targetId = await this.ensureThreadSelected(binding);
+    const baselineReply = this.pendingReplyBaselines.get(binding.sessionKey);
+    let candidateReply: AssistantReplySnapshot | null = null;
+    let latestNewReply: AssistantReplySnapshot | null = null;
+    let stablePolls = 0;
+    let emittedReplyText = "";
+    const emittedMediaReferences = new Set<string>();
+    const turnId = randomUUID();
+    let turnSequence = 0;
+    const emitTurnEvent = async (
+      eventType: TurnEventType,
+      payload: TurnEventPayload,
+      isFinal: boolean
+    ): Promise<void> => {
+      if (!options.onTurnEvent) {
+        return;
+      }
+
+      turnSequence += 1;
+      await options.onTurnEvent({
+        sessionKey: binding.sessionKey,
+        turnId,
+        sequence: turnSequence,
+        eventType,
+        createdAt: new Date().toISOString(),
+        isFinal,
+        payload
+      });
+    };
+
+    for (let attempt = 0; attempt < this.maxReplyPollAttempts; attempt += 1) {
+      const reply = await this.readLatestAssistantSnapshot(targetId);
+      const hasReplyText = typeof reply.reply === "string" && reply.reply.trim() !== "";
+      const hasReplyContent = hasReplyText || reply.mediaReferences.length > 0;
+      const isNewReply =
+        hasReplyContent &&
+        (baselineReply === undefined || this.isNewAssistantReply(reply, baselineReply));
+
+      if (isNewReply) {
+        latestNewReply = reply;
+        if (!this.isSameAssistantReply(reply, candidateReply)) {
+          candidateReply = reply;
+          stablePolls = reply.isStreaming ? 0 : 1;
+        } else {
+          stablePolls += 1;
+        }
+
+        if (
+          candidateReply &&
+          this.hasAssistantContent(candidateReply) &&
+          !reply.isStreaming &&
+          stablePolls >= this.replyStablePolls
+        ) {
+          this.pendingReplyBaselines.delete(binding.sessionKey);
+          const finalPayload: TurnEventPayload = {
+            fullText: candidateReply.reply ?? "",
+            mediaReferences: candidateReply.mediaReferences
+          };
+          if (options.onDraft) {
+            const finalDeltaDraft = this.buildIncrementalDraftFromSnapshot(
+              binding.sessionKey,
+              candidateReply,
+              emittedReplyText,
+              emittedMediaReferences,
+              turnId
+            );
+            if (finalDeltaDraft) {
+              await emitTurnEvent(
+                TurnEventType.Delta,
+                {
+                  text: finalDeltaDraft.text,
+                  fullText: candidateReply.reply ?? "",
+                  mediaReferences: candidateReply.mediaReferences
+                },
+                false
+              );
+              emittedReplyText = this.mergeObservedReply(emittedReplyText, candidateReply.reply ?? "");
+              this.mergeObservedMediaReferences(emittedMediaReferences, candidateReply.mediaReferences);
+            }
+            await emitTurnEvent(
+              TurnEventType.Completed,
+              {
+                ...finalPayload,
+                completionReason: "stable"
+              },
+              true
+            );
+            await options.onDraft(
+              this.buildOutboundDraftFromSnapshot(binding.sessionKey, candidateReply, turnId)
+            );
+            return [];
+          }
+          await emitTurnEvent(
+            TurnEventType.Delta,
+            finalPayload,
+            false
+          );
+          await emitTurnEvent(
+            TurnEventType.Completed,
+            {
+              ...finalPayload,
+              completionReason: "stable"
+            },
+            true
+          );
+          return [this.buildOutboundDraftFromSnapshot(binding.sessionKey, candidateReply, turnId)];
+        }
+
+        if (
+          options.onDraft &&
+          candidateReply &&
+          this.hasAssistantContent(candidateReply) &&
+          stablePolls >= this.partialReplyStablePolls
+        ) {
+          const deltaDraft = this.buildIncrementalDraftFromSnapshot(
+            binding.sessionKey,
+            candidateReply,
+            emittedReplyText,
+            emittedMediaReferences,
+            turnId
+          );
+          if (deltaDraft) {
+            await emitTurnEvent(
+              TurnEventType.Delta,
+              {
+                text: deltaDraft.text,
+                fullText: candidateReply.reply ?? "",
+                mediaReferences: candidateReply.mediaReferences
+              },
+              false
+            );
+            emittedReplyText = this.mergeObservedReply(emittedReplyText, candidateReply.reply ?? "");
+            this.mergeObservedMediaReferences(emittedMediaReferences, candidateReply.mediaReferences);
+            stablePolls = 0;
+          }
+        }
+      } else if (candidateReply) {
+        stablePolls = 0;
+      }
+
+      if (attempt + 1 < this.maxReplyPollAttempts) {
+        await this.sleep(this.replyPollIntervalMs);
+      }
+    }
+
+    this.pendingReplyBaselines.delete(binding.sessionKey);
+    if (latestNewReply && this.hasAssistantContent(latestNewReply)) {
+      if (options.onDraft) {
+        const timeoutDraft = this.buildIncrementalDraftFromSnapshot(
+          binding.sessionKey,
+          latestNewReply,
+          emittedReplyText,
+          emittedMediaReferences,
+          turnId
+        );
+        if (timeoutDraft) {
+          await emitTurnEvent(
+            TurnEventType.Delta,
+            {
+              text: timeoutDraft.text,
+              fullText: latestNewReply.reply ?? "",
+              mediaReferences: latestNewReply.mediaReferences
+            },
+            false
+          );
+        }
+        await emitTurnEvent(
+          TurnEventType.Completed,
+          {
+            fullText: latestNewReply.reply ?? "",
+            mediaReferences: latestNewReply.mediaReferences,
+            completionReason: "timeout_flush"
+          },
+          true
+        );
+        await options.onDraft(
+          this.buildOutboundDraftFromSnapshot(binding.sessionKey, latestNewReply, turnId)
+        );
+        return [];
+      }
+      await emitTurnEvent(
+        TurnEventType.Delta,
+        {
+          fullText: latestNewReply.reply ?? "",
+          mediaReferences: latestNewReply.mediaReferences
+        },
+        false
+      );
+      await emitTurnEvent(
+        TurnEventType.Completed,
+        {
+          fullText: latestNewReply.reply ?? "",
+          mediaReferences: latestNewReply.mediaReferences,
+          completionReason: "timeout_flush"
+        },
+        true
+      );
+      return [this.buildOutboundDraftFromSnapshot(binding.sessionKey, latestNewReply, turnId)];
+    }
+
+    throw new DesktopDriverError(
+      "Codex desktop reply did not arrive before timeout",
+      "reply_timeout"
+    );
+  }
+
+  private buildOutboundDraftFromSnapshot(
+    sessionKey: string,
+    snapshot: AssistantReplySnapshot,
+    turnId?: string
+  ): OutboundDraft {
+    return {
+      draftId: randomUUID(),
+      ...(turnId ? { turnId } : {}),
+      sessionKey,
+      text: snapshot.reply ?? "",
+      ...(snapshot.mediaReferences.length > 0
+        ? {
+            mediaArtifacts: snapshot.mediaReferences.map((reference) =>
+              buildMediaArtifactFromReference(reference)
+            )
+          }
+        : {}),
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  private buildOutboundDraftFromText(
+    sessionKey: string,
+    text: string,
+    mediaReferences: string[],
+    turnId?: string
+  ): OutboundDraft {
+    return {
+      draftId: randomUUID(),
+      ...(turnId ? { turnId } : {}),
+      sessionKey,
+      text,
+      ...(mediaReferences.length > 0
+        ? {
+            mediaArtifacts: mediaReferences.map((reference) =>
+              buildMediaArtifactFromReference(reference)
+            )
+          }
+        : {}),
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  private buildIncrementalDraftFromSnapshot(
+    sessionKey: string,
+    snapshot: AssistantReplySnapshot,
+    emittedReplyText: string,
+    emittedMediaReferences: Set<string>,
+    turnId?: string
+  ): OutboundDraft | null {
+    const fullReply = snapshot.reply ?? "";
+    const deltaText = this.extractReplyDelta(emittedReplyText, fullReply).trim();
+    const incrementalMediaReferences = snapshot.mediaReferences.filter(
+      (reference) => !emittedMediaReferences.has(reference)
+    );
+
+    if (!deltaText && incrementalMediaReferences.length === 0) {
+      return null;
+    }
+
+    return {
+      draftId: randomUUID(),
+      ...(turnId ? { turnId } : {}),
+      sessionKey,
+      text: deltaText,
+      ...(incrementalMediaReferences.length > 0
+        ? {
+            mediaArtifacts: incrementalMediaReferences.map((reference) =>
+              buildMediaArtifactFromReference(reference)
+            )
+          }
+        : {}),
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  private extractReplyDelta(previous: string, next: string): string {
+    if (!previous) {
+      return next;
+    }
+
+    if (next.startsWith(previous)) {
+      return next.slice(previous.length);
+    }
+
+    return next;
+  }
+
+  private mergeObservedReply(previous: string, next: string): string {
+    if (!previous) {
+      return next;
+    }
+
+    if (next.startsWith(previous)) {
+      return next;
+    }
+
+    return next;
+  }
+
+  private mergeObservedMediaReferences(
+    emittedMediaReferences: Set<string>,
+    mediaReferences: string[]
+  ): void {
+    for (const reference of mediaReferences) {
+      emittedMediaReferences.add(reference);
+    }
+  }
+
+  private hasAssistantContent(snapshot: AssistantReplySnapshot): boolean {
+    return Boolean(snapshot.reply && snapshot.reply.trim()) || snapshot.mediaReferences.length > 0;
+  }
+
+  private async collectAssistantReplyFromLocalRollout(
+    binding: DriverBinding,
+    localReply: CodexLocalRolloutTurnResult,
+    options: ConversationRunOptions
+  ): Promise<OutboundDraft[]> {
+    const turnId = localReply.turnId ?? randomUUID();
+    let turnSequence = 0;
+    const emitTurnEvent = async (
+      eventType: TurnEventType,
+      payload: TurnEventPayload,
+      isFinal: boolean
+    ): Promise<void> => {
+      if (!options.onTurnEvent) {
+        return;
+      }
+
+      turnSequence += 1;
+      await options.onTurnEvent({
+        sessionKey: binding.sessionKey,
+        turnId,
+        sequence: turnSequence,
+        eventType,
+        createdAt: new Date().toISOString(),
+        isFinal,
+        payload
+      });
+    };
+
+    if (options.onDraft) {
+      let assembledText = "";
+      for (const commentary of localReply.commentaryMessages) {
+        assembledText = assembledText ? `${assembledText}\n${commentary}` : commentary;
+        await emitTurnEvent(
+          TurnEventType.Delta,
+          {
+            text: commentary,
+            fullText: assembledText,
+            mediaReferences: []
+          },
+          false
+        );
+      }
+
+      await emitTurnEvent(
+        TurnEventType.Completed,
+        {
+          fullText: localReply.fullText,
+          mediaReferences: localReply.mediaReferences,
+          completionReason: "stable"
+        },
+        true
+      );
+      await options.onDraft(
+        this.buildOutboundDraftFromText(
+          binding.sessionKey,
+          localReply.fullText,
+          localReply.mediaReferences,
+          turnId
+        )
+      );
+      return [];
+    }
+
+    await emitTurnEvent(
+      TurnEventType.Delta,
+      {
+        fullText: localReply.finalText,
+        mediaReferences: localReply.mediaReferences
+      },
+      false
+    );
+    await emitTurnEvent(
+      TurnEventType.Completed,
+      {
+        fullText: localReply.finalText,
+        mediaReferences: localReply.mediaReferences,
+        completionReason: "stable"
+      },
+      true
+    );
+    return [
+      this.buildOutboundDraftFromText(
+        binding.sessionKey,
+        localReply.finalText,
+        localReply.mediaReferences,
+        turnId
+      )
+    ];
+  }
+
+  async markSessionBroken(_sessionKey: string, _reason: string): Promise<void> {
+    return;
+  }
+
+  private async capturePendingLocalRolloutCursor(binding: DriverBinding): Promise<void> {
+    if (!this.localRolloutReader) {
+      return;
+    }
+
+    const locator =
+      typeof binding.codexThreadRef === "string" && binding.codexThreadRef.startsWith(THREAD_REF_PREFIX)
+        ? this.decodeThreadRef(binding.codexThreadRef)
+        : null;
+    if (!locator?.title) {
+      this.pendingLocalRolloutCursors.delete(binding.sessionKey);
+      return;
+    }
+
+    const cursor = this.localRolloutReader.captureCursorForThreadTitle(locator.title);
+    if (!cursor) {
+      this.pendingLocalRolloutCursors.delete(binding.sessionKey);
+      return;
+    }
+
+    this.pendingLocalRolloutCursors.set(binding.sessionKey, cursor);
+  }
+
+  private capturePendingLocalSubmissionCursor(
+    binding: DriverBinding
+  ): CodexLocalSubmissionCursor | null {
+    if (!this.localSubmissionReader) {
+      return null;
+    }
+
+    const rolloutCursor = this.pendingLocalRolloutCursors.get(binding.sessionKey);
+    if (!rolloutCursor?.threadId) {
+      return null;
+    }
+
+    return this.localSubmissionReader.captureCursorForThreadId(rolloutCursor.threadId);
+  }
+
+  private attachPendingTurnId(sessionKey: string, turnId: string | null | undefined): void {
+    if (!turnId) {
+      return;
+    }
+
+    const cursor = this.pendingLocalRolloutCursors.get(sessionKey);
+    if (!cursor) {
+      return;
+    }
+
+    cursor.targetTurnId = turnId;
+    cursor.competingTurnStarted = false;
+  }
+
+  private captureAdHocLocalRolloutCursor(binding: DriverBinding): CodexLocalRolloutCursor | null {
+    if (!this.localRolloutReader) {
+      return null;
+    }
+
+    const locator =
+      typeof binding.codexThreadRef === "string" && binding.codexThreadRef.startsWith(THREAD_REF_PREFIX)
+        ? this.decodeThreadRef(binding.codexThreadRef)
+        : null;
+    if (!locator?.title) {
+      return null;
+    }
+
+    return this.localRolloutReader.captureCursorForThreadTitle(locator.title);
+  }
+
+  private async ensureThreadSelected(binding: DriverBinding): Promise<string> {
+    const targetId = await this.resolveTargetId(binding);
+    const boundThreadRef = binding.codexThreadRef;
+    if (!boundThreadRef) {
+      return targetId;
+    }
+
+    const locator = this.decodeThreadRef(boundThreadRef);
+
+    if (!locator) {
+      return targetId;
+    }
+
+    const threads = await this.listRecentThreads(200);
+    const currentThread = threads.find((thread) => thread.isCurrent);
+    if (currentThread?.threadRef === boundThreadRef) {
+      return targetId;
+    }
+
+    const previousFingerprint = await this.readConversationViewportFingerprint(targetId);
+
+    const switchResult = (await this.cdp.evaluateOnPage(
+      this.buildSelectThreadScript(locator),
+      targetId
+    )) as { ok?: boolean; reason?: string } | undefined;
+
+    if (!switchResult?.ok) {
+      throw new DesktopDriverError(
+        `Codex desktop thread switch failed: ${switchResult?.reason ?? "unknown"}`,
+        "session_not_found"
+      );
+    }
+
+    await this.waitForThreadActivation(boundThreadRef, targetId, previousFingerprint);
+    return targetId;
+  }
+
+  private async waitForThreadActivation(
+    threadRef: string,
+    targetId: string,
+    previousFingerprint: ConversationViewportFingerprint | null
+  ): Promise<void> {
+    let currentThreadStablePolls = 0;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const currentThread = (await this.listRecentThreads(200)).find((thread) => thread.isCurrent);
+      const currentMatches = currentThread?.threadRef === threadRef;
+
+      if (currentMatches) {
+        currentThreadStablePolls += 1;
+        const currentFingerprint = await this.readConversationViewportFingerprint(targetId);
+        if (
+          !this.isSameConversationViewportFingerprint(currentFingerprint, previousFingerprint)
+          || currentThreadStablePolls >= 4
+        ) {
+          return;
+        }
+      } else {
+        currentThreadStablePolls = 0;
+      }
+
+      if (attempt + 1 < 20) {
+        await this.sleep(100);
+      }
+    }
+
+    throw new DesktopDriverError(
+      "Codex desktop thread switch failed: thread_activation_timeout",
+      "session_not_found"
+    );
+  }
+
+  private async readConversationViewportFingerprint(
+    targetId: string
+  ): Promise<ConversationViewportFingerprint | null> {
+    const fingerprint = await this.cdp.evaluateOnPage(
+      this.buildConversationViewportFingerprintProbeScript(),
+      targetId
+    );
+    if (
+      !fingerprint ||
+      typeof fingerprint !== "object" ||
+      !("latestUnitKey" in fingerprint) ||
+      !("latestSnippet" in fingerprint) ||
+      !("unitCount" in fingerprint)
+    ) {
+      return null;
+    }
+
+    return {
+      latestUnitKey:
+        typeof fingerprint.latestUnitKey === "string" && fingerprint.latestUnitKey.trim()
+          ? fingerprint.latestUnitKey
+          : null,
+      latestSnippet:
+        typeof fingerprint.latestSnippet === "string" && fingerprint.latestSnippet.trim()
+          ? fingerprint.latestSnippet
+          : null,
+      unitCount:
+        typeof fingerprint.unitCount === "number" && Number.isFinite(fingerprint.unitCount)
+          ? fingerprint.unitCount
+          : 0
+    };
+  }
+
+  private isSameConversationViewportFingerprint(
+    left: ConversationViewportFingerprint | null,
+    right: ConversationViewportFingerprint | null
+  ): boolean {
+    if (!left && !right) {
+      return true;
+    }
+
+    if (!left || !right) {
+      return false;
+    }
+
+    return (
+      left.latestUnitKey === right.latestUnitKey
+      && left.latestSnippet === right.latestSnippet
+      && left.unitCount === right.unitCount
+    );
+  }
+
+  private async readLatestAssistantSnapshot(targetId: string): Promise<AssistantReplySnapshot> {
+    const structuredReply = await this.cdp.evaluateOnPage(
+      this.buildAssistantReplyProbeScript(),
+      targetId
+    );
+    if (
+      structuredReply &&
+      typeof structuredReply === "object" &&
+      "reply" in structuredReply
+    ) {
+      const rawReply = structuredReply.reply;
+      const normalizedReply = typeof rawReply === "string" ? rawReply.trim() : "";
+      const unitKey =
+        "unitKey" in structuredReply && typeof structuredReply.unitKey === "string"
+          ? structuredReply.unitKey
+          : null;
+      const mediaReferences =
+        "mediaReferences" in structuredReply && Array.isArray(structuredReply.mediaReferences)
+          ? structuredReply.mediaReferences.filter(
+              (reference): reference is string =>
+                typeof reference === "string" && reference.trim().length > 0
+            )
+          : [];
+      const isStreaming =
+        "isStreaming" in structuredReply && typeof structuredReply.isStreaming === "boolean"
+          ? structuredReply.isStreaming
+          : false;
+      return {
+        unitKey,
+        reply: normalizedReply || null,
+        mediaReferences,
+        isStreaming
+      };
+    }
+
+    const snapshotText = await this.cdp.evaluateOnPage("document.body.innerText", targetId);
+    if (typeof snapshotText !== "string") {
+      throw new DesktopDriverError(
+        "Codex desktop reply snapshot was not a string",
+        "reply_parse_failed"
+      );
+    }
+
+    const parsedReply = parseAssistantReply(snapshotText).trim();
+    return {
+      unitKey: null,
+      reply: parsedReply || null,
+      mediaReferences: [],
+      isStreaming: false
+    };
+  }
+
+  private isNewAssistantReply(
+    current: AssistantReplySnapshot,
+    baseline: AssistantReplySnapshot
+  ): boolean {
+    if (current.unitKey && baseline.unitKey) {
+      return current.unitKey !== baseline.unitKey;
+    }
+
+    return current.reply !== baseline.reply;
+  }
+
+  private isSameAssistantReply(
+    current: AssistantReplySnapshot,
+    candidate: AssistantReplySnapshot | null
+  ): boolean {
+    if (!candidate) {
+      return false;
+    }
+
+    if (current.unitKey && candidate.unitKey) {
+      return (
+        current.unitKey === candidate.unitKey &&
+        current.reply === candidate.reply &&
+        current.isStreaming === candidate.isStreaming &&
+        JSON.stringify(current.mediaReferences) === JSON.stringify(candidate.mediaReferences)
+      );
+    }
+
+    return (
+      current.reply === candidate.reply &&
+      current.isStreaming === candidate.isStreaming &&
+      JSON.stringify(current.mediaReferences) === JSON.stringify(candidate.mediaReferences)
+    );
+  }
+
+  private async waitForFreshThreadContext(targetId: string): Promise<void> {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const probe = (await this.cdp.evaluateOnPage(
+        this.buildFreshThreadProbeScript(),
+        targetId
+      )) as { ok?: boolean } | undefined;
+
+      if (probe?.ok) {
+        return;
+      }
+
+      if (attempt + 1 < 20) {
+        await this.sleep(100);
+      }
+    }
+
+    throw new DesktopDriverError(
+      "Codex desktop new thread did not become active",
+      "session_not_found"
+    );
+  }
+
+  private async resolvePageTarget() {
+    const targets = await this.cdp.listTargets();
+    const pageTarget = targets.find((target) => target.type === "page");
+
+    if (!pageTarget) {
+      throw new DesktopDriverError(
+        "Codex desktop app is not exposing any inspectable page target",
+        "session_not_found"
+      );
+    }
+
+    return pageTarget;
+  }
+
+  private async resolveTargetId(binding: DriverBinding): Promise<string> {
+    if (binding.codexThreadRef?.startsWith(THREAD_REF_PREFIX)) {
+      const locator = this.decodeThreadRef(binding.codexThreadRef);
+      if (locator) {
+        return locator.pageId;
+      }
+    }
+
+    if (binding.codexThreadRef?.startsWith(TARGET_REF_PREFIX)) {
+      return binding.codexThreadRef.slice(TARGET_REF_PREFIX.length);
+    }
+
+    const rebound = await this.openOrBindSession(binding.sessionKey, binding);
+    return this.resolveTargetId(rebound);
+  }
+
+  private encodeThreadRef(locator: ThreadLocator): string {
+    const encoded = Buffer.from(
+      JSON.stringify({
+        title: locator.title,
+        projectName: locator.projectName
+      }),
+      "utf8"
+    ).toString("base64url");
+    return `${THREAD_REF_PREFIX}${locator.pageId}:${encoded}`;
+  }
+
+  private decodeThreadRef(threadRef: string): ThreadLocator | null {
+    if (!threadRef.startsWith(THREAD_REF_PREFIX)) {
+      return null;
+    }
+
+    const payload = threadRef.slice(THREAD_REF_PREFIX.length);
+    const separatorIndex = payload.indexOf(":");
+    if (separatorIndex <= 0) {
+      return null;
+    }
+
+    const pageId = payload.slice(0, separatorIndex);
+    const encodedLocator = payload.slice(separatorIndex + 1);
+
+    try {
+      const locator = JSON.parse(
+        Buffer.from(encodedLocator, "base64url").toString("utf8")
+      ) as { title?: string; projectName?: string | null };
+
+      if (typeof locator.title !== "string" || locator.title.trim() === "") {
+        return null;
+      }
+
+      return {
+        pageId,
+        title: locator.title,
+        projectName:
+          typeof locator.projectName === "string" && locator.projectName.trim() !== ""
+            ? locator.projectName
+            : null
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private buildThreadListScript(): string {
+    return `(() => {
+      const toText = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+      const extractProjectName = (titleNode) => {
+        const row = titleNode.closest('[role="button"]');
+        if (!(row instanceof HTMLElement)) {
+          return null;
+        }
+        const candidates = [
+          row.closest('[role="listitem"]'),
+          row.parentElement,
+          row.parentElement?.parentElement,
+          row.parentElement?.parentElement?.parentElement
+        ];
+        for (const candidate of candidates) {
+          if (!(candidate instanceof HTMLElement)) {
+            continue;
+          }
+          const aria = toText(candidate.getAttribute('aria-label'));
+          if (!aria) {
+            continue;
+          }
+          const quotedMatch = aria.match(/[“"]([^”"]+)[”"]中的自动化操作/);
+          if (quotedMatch) {
+            return quotedMatch[1];
+          }
+          const plainMatch = aria.match(/^(.+?)中的自动化操作$/);
+          if (plainMatch) {
+            return plainMatch[1];
+          }
+        }
+        return null;
+      };
+      const rows = Array.from(document.querySelectorAll('[data-thread-title="true"]'))
+        .map((titleNode) => {
+          if (!(titleNode instanceof HTMLElement)) {
+            return null;
+          }
+          const row = titleNode.closest('[role="button"]');
+          if (!(row instanceof HTMLElement)) {
+            return null;
+          }
+          const timeNode = row.querySelector('.text-token-description-foreground');
+          return {
+            title: toText(titleNode.innerText),
+            projectName: extractProjectName(titleNode),
+            relativeTime: timeNode instanceof HTMLElement ? toText(timeNode.innerText) || null : null,
+            isCurrent: row.getAttribute('aria-current') === 'page'
+          };
+        })
+        .filter((thread) => thread && thread.title);
+      return rows;
+    })();`;
+  }
+
+  private compareThreadActivity(left: RawSidebarThread, right: RawSidebarThread): number {
+    const leftRank = this.parseRelativeActivityRank(left.relativeTime);
+    const rightRank = this.parseRelativeActivityRank(right.relativeTime);
+
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+
+    if (left.isCurrent !== right.isCurrent) {
+      return left.isCurrent ? -1 : 1;
+    }
+
+    return left.title.localeCompare(right.title, "zh-CN");
+  }
+
+  private parseRelativeActivityRank(relativeTime: string | null): number {
+    if (!relativeTime) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const value = relativeTime.trim().toLowerCase();
+    if (!value) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    if (
+      value === "刚刚" ||
+      value === "现在" ||
+      value === "just now" ||
+      value === "now" ||
+      value === "today"
+    ) {
+      return 0;
+    }
+
+    const minuteMatch = value.match(/(\d+)\s*(分钟|分|min|mins|minute|minutes)/i);
+    if (minuteMatch) {
+      return Number(minuteMatch[1]);
+    }
+
+    const hourMatch = value.match(/(\d+)\s*(小时|时|hr|hrs|hour|hours)/i);
+    if (hourMatch) {
+      return Number(hourMatch[1]) * 60;
+    }
+
+    const dayMatch = value.match(/(\d+)\s*(天|day|days)/i);
+    if (dayMatch) {
+      return Number(dayMatch[1]) * 24 * 60;
+    }
+
+    const weekMatch = value.match(/(\d+)\s*(周|week|weeks)/i);
+    if (weekMatch) {
+      return Number(weekMatch[1]) * 7 * 24 * 60;
+    }
+
+    const monthMatch = value.match(/(\d+)\s*(月|month|months)/i);
+    if (monthMatch) {
+      return Number(monthMatch[1]) * 30 * 24 * 60;
+    }
+
+    return Number.POSITIVE_INFINITY;
+  }
+
+  private buildSelectThreadScript(locator: ThreadLocator): string {
+    const expectedTitle = JSON.stringify(locator.title);
+    const expectedProject = JSON.stringify(locator.projectName);
+    return `(() => {
+      const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+      const extractProjectName = (titleNode) => {
+        const row = titleNode.closest('[role="button"]');
+        if (!(row instanceof HTMLElement)) {
+          return null;
+        }
+        const candidates = [
+          row.closest('[role="listitem"]'),
+          row.parentElement,
+          row.parentElement?.parentElement,
+          row.parentElement?.parentElement?.parentElement
+        ];
+        for (const candidate of candidates) {
+          if (!(candidate instanceof HTMLElement)) {
+            continue;
+          }
+          const aria = normalize(candidate.getAttribute('aria-label'));
+          if (!aria) {
+            continue;
+          }
+          const quotedMatch = aria.match(/[“"]([^”"]+)[”"]中的自动化操作/);
+          if (quotedMatch) {
+            return quotedMatch[1];
+          }
+          const plainMatch = aria.match(/^(.+?)中的自动化操作$/);
+          if (plainMatch) {
+            return plainMatch[1];
+          }
+        }
+        return null;
+      };
+      const target = Array.from(document.querySelectorAll('[data-thread-title="true"]'))
+        .find((titleNode) => {
+          if (!(titleNode instanceof HTMLElement)) {
+            return false;
+          }
+          const row = titleNode.closest('[role="button"]');
+          if (!(row instanceof HTMLElement)) {
+            return false;
+          }
+          const projectName = extractProjectName(titleNode);
+          return normalize(titleNode.innerText) === normalize(${expectedTitle})
+            && normalize(projectName) === normalize(${expectedProject});
+        });
+      if (!(target instanceof HTMLElement)) {
+        return { ok: false, reason: 'thread_not_found' };
+      }
+      const row = target.closest('[role="button"]');
+      if (!(row instanceof HTMLElement)) {
+        return { ok: false, reason: 'row_not_found' };
+      }
+      if (row.getAttribute('aria-current') === 'page') {
+        return { ok: true, reason: 'already_current' };
+      }
+      row.focus();
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        row.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      return { ok: true, reason: 'clicked_thread' };
+    })();`;
+  }
+
+  private buildNewThreadScript(): string {
+    return `(() => {
+      const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const button = controls.find((candidate) => {
+        if (!(candidate instanceof HTMLElement)) {
+          return false;
+        }
+        const text = (candidate.textContent || '').replace(/\\s+/g, ' ').trim();
+        const aria = candidate.getAttribute('aria-label') || '';
+        return text === '新线程' || aria.includes('开始新线程');
+      });
+      if (!(button instanceof HTMLElement)) {
+        return { ok: false, reason: 'new_thread_button_not_found' };
+      }
+      button.focus();
+      if (typeof button.click === 'function') {
+        button.click();
+      }
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      return { ok: true, reason: 'clicked_new_thread' };
+    })();`;
+  }
+
+  private buildFreshThreadProbeScript(): string {
+    return `(() => {
+      const composer = document.querySelector(
+        '[data-codex-composer="true"], textarea, input[type="text"], [contenteditable="true"]'
+      );
+      const readComposerText = (node) => {
+        if (!(node instanceof HTMLElement)) {
+          return '';
+        }
+        if ('value' in node && typeof node.value === 'string') {
+          return node.value;
+        }
+        return node.textContent || '';
+      };
+      const assistantUnits = document.querySelectorAll('[data-content-search-unit-key]').length;
+      const composerText = readComposerText(composer).trim();
+      const fresh = assistantUnits === 0 && composerText.length === 0;
+      return { ok: fresh, reason: fresh ? 'fresh_thread' : 'thread_not_ready' };
+    })();`;
+  }
+
+  private buildFocusComposerScript(): string {
+    return `(() => {
+      const resolveComposer = () => {
+        const selectors = [
+          '[data-codex-composer="true"]',
+          'textarea',
+          'input[type="text"]',
+          '[contenteditable="true"]',
+          '[role="textbox"]'
+        ];
+        const candidates = selectors
+          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+          .filter((candidate) => {
+            if (!(candidate instanceof HTMLElement)) {
+              return false;
+            }
+            if (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true') {
+              return false;
+            }
+            const rect = candidate.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLElement && candidates.includes(activeElement)) {
+          return activeElement;
+        }
+        return candidates
+          .sort((left, right) => right.getBoundingClientRect().y - left.getBoundingClientRect().y)
+          .at(0) ?? null;
+      };
+      const input = resolveComposer();
+      if (!input) {
+        return { ok: false, reason: 'input_not_found' };
+      }
+      input.focus();
+      return { ok: true, reason: 'focused_input' };
+    })();`;
+  }
+
+  private buildInterruptActiveTurnScript(): string {
+    return `(() => {
+      const composer = document.querySelector(
+        '[data-codex-composer="true"], textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'
+      );
+      const composerRect = composer instanceof HTMLElement
+        ? composer.getBoundingClientRect()
+        : null;
+      const stopMatcher = /(\\bstop\\b|\\bcancel\\b|停止|中止|取消)/i;
+      const controls = Array.from(
+        document.querySelectorAll('button, [role="button"], [aria-label]')
+      );
+      const stopButton = controls.find((node) => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        const nearComposer = composerRect
+          ? rect.y >= composerRect.y - 48 && rect.y <= composerRect.bottom + 48
+          : rect.y >= window.innerHeight - 160;
+        if (!nearComposer) {
+          return false;
+        }
+        const label = [
+          node.textContent || '',
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || ''
+        ].join(' ').trim();
+        if (stopMatcher.test(label)) {
+          return true;
+        }
+        const className = String(node.className || '');
+        const html = node.innerHTML || '';
+        return className.includes('size-token-button-composer')
+          && (html.includes('M4.5 5.75C4.5 5.05964') || html.includes('M4.5 5.75C4.5 5.0596'));
+      });
+      if (!(stopButton instanceof HTMLElement)) {
+        return { interrupted: false };
+      }
+      stopButton.focus();
+      if (typeof stopButton.click === 'function') {
+        stopButton.click();
+      } else {
+        stopButton.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+      }
+      return { interrupted: true };
+    })()`;
+  }
+
+  private buildSubmitComposerScript(): string {
+    const submitButtonMatcher = isLikelyComposerSubmitButton
+      .toString()
+      .replace(/^function\s+isLikelyComposerSubmitButton/, "function isLikelyComposerSubmitButton");
+
+    return `(() => {
+      ${submitButtonMatcher}
+      const readConversationFingerprint = () => {
+        const units = Array.from(document.querySelectorAll('[data-content-search-unit-key]'))
+          .filter((node) => node instanceof HTMLElement)
+          .map((node) => {
+            if (!(node instanceof HTMLElement)) {
+              return null;
+            }
+            const rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) {
+              return null;
+            }
+            return node;
+          })
+          .filter((node) => node instanceof HTMLElement);
+        const latestUnit = units.at(-1);
+        return {
+          latestUnitKey:
+            latestUnit instanceof HTMLElement
+              ? latestUnit.getAttribute('data-content-search-unit-key')
+              : null,
+          latestSnippet:
+            latestUnit instanceof HTMLElement
+              ? (latestUnit.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200)
+              : null,
+          unitCount: units.length
+        };
+      };
+      const isSameConversationFingerprint = (left, right) =>
+        Boolean(left && right)
+        && left.latestUnitKey === right.latestUnitKey
+        && left.latestSnippet === right.latestSnippet
+        && left.unitCount === right.unitCount;
+      const resolveComposer = () => {
+        const selectors = [
+          '[data-codex-composer="true"]',
+          'textarea',
+          'input[type="text"]',
+          '[contenteditable="true"]',
+          '[role="textbox"]'
+        ];
+        const candidates = selectors
+          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+          .filter((candidate) => {
+            if (!(candidate instanceof HTMLElement)) {
+              return false;
+            }
+            if (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true') {
+              return false;
+            }
+            const rect = candidate.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLElement && candidates.includes(activeElement)) {
+          return activeElement;
+        }
+        return candidates
+          .sort((left, right) => right.getBoundingClientRect().y - left.getBoundingClientRect().y)
+          .at(0) ?? null;
+      };
+      const readComposerText = (node) => {
+        if (!(node instanceof HTMLElement)) {
+          return '';
+        }
+        if ('value' in node && typeof node.value === 'string') {
+          return node.value;
+        }
+        return node.textContent || '';
+      };
+      const resolveComposerSubmitButton = (allowDisabled, strictMatch) =>
+        Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter((candidate) => {
+            if (!(candidate instanceof HTMLElement)) {
+              return false;
+            }
+            const rect = candidate.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) {
+              return false;
+            }
+            if (
+              !allowDisabled
+              && (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true')
+            ) {
+              return false;
+            }
+            const centerX = rect.x + rect.width / 2;
+            const centerY = rect.y + rect.height / 2;
+            const nearComposerBottomRight =
+              centerX >= inputRect.right - 140
+              && centerY >= inputRect.y - 24
+              && centerY <= inputRect.bottom + 40;
+            if (!nearComposerBottomRight) {
+              return false;
+            }
+            if (!strictMatch) {
+              return true;
+            }
+            return isLikelyComposerSubmitButton({
+              text: candidate.textContent ?? '',
+              aria: candidate.getAttribute('aria-label'),
+              title: candidate.getAttribute('title'),
+              className: candidate.className ?? ''
+            });
+          })
+          .sort((left, right) => {
+            const leftRect = left.getBoundingClientRect();
+            const rightRect = right.getBoundingClientRect();
+            const leftLabel = {
+              text: left.textContent ?? '',
+              aria: left.getAttribute('aria-label'),
+              title: left.getAttribute('title'),
+              className: left.className ?? ''
+            };
+            const rightLabel = {
+              text: right.textContent ?? '',
+              aria: right.getAttribute('aria-label'),
+              title: right.getAttribute('title'),
+              className: right.className ?? ''
+            };
+            const leftStrictScore = isLikelyComposerSubmitButton(leftLabel) ? 1000 : 0;
+            const rightStrictScore = isLikelyComposerSubmitButton(rightLabel) ? 1000 : 0;
+            const leftPrimaryScore = /\bsize-token-button-composer\b/i.test(leftLabel.className) ? 100 : 0;
+            const rightPrimaryScore = /\bsize-token-button-composer\b/i.test(rightLabel.className) ? 100 : 0;
+            const leftScore =
+              leftStrictScore + leftPrimaryScore + leftRect.x - Math.abs(leftRect.y - inputRect.bottom);
+            const rightScore =
+              rightStrictScore + rightPrimaryScore + rightRect.x - Math.abs(rightRect.y - inputRect.bottom);
+            return rightScore - leftScore;
+          })
+          .at(0) ?? null;
+      const input = resolveComposer();
+      if (!(input instanceof HTMLElement)) {
+        return { ok: false, reason: 'input_not_found' };
+      }
+      const inputRect = input.getBoundingClientRect();
+      const currentText = readComposerText(input).trim();
+      if (!currentText) {
+        return { ok: false, reason: 'empty_input' };
+      }
+      const beforeConversationFingerprint = readConversationFingerprint();
+      window.__qqCodexLastSubmitConversationFingerprint = beforeConversationFingerprint;
+      const sendButton = resolveComposerSubmitButton(false, true);
+      const beforeButtonHtml = sendButton instanceof HTMLElement ? sendButton.innerHTML : '';
+      window.__qqCodexLastSubmitButtonHtml = beforeButtonHtml;
+      const confirmSubmission = (reason) => new Promise((resolve) => {
+        window.setTimeout(() => {
+          const afterText = readComposerText(input).trim();
+          const currentSendButton = resolveComposerSubmitButton(true, false);
+          const afterButtonHtml =
+            currentSendButton instanceof HTMLElement ? currentSendButton.innerHTML : '';
+          const buttonChanged = beforeButtonHtml !== '' && beforeButtonHtml !== afterButtonHtml;
+          const afterConversationFingerprint = readConversationFingerprint();
+          const conversationAdvanced = !isSameConversationFingerprint(
+            beforeConversationFingerprint,
+            afterConversationFingerprint
+          );
+          resolve({
+            ok: afterText.length === 0 || buttonChanged || conversationAdvanced,
+            reason: afterText.length === 0
+              ? reason
+              : (
+                  buttonChanged
+                    ? 'entered_streaming_state'
+                    : (conversationAdvanced ? 'conversation_advanced' : 'submit_not_confirmed')
+                )
+          });
+        }, 300);
+      });
+      const form = input.closest('form');
+      if (form && typeof form.requestSubmit === 'function') {
+        form.requestSubmit();
+        return confirmSubmission('submitted_form');
+      }
+      if (sendButton instanceof HTMLElement) {
+        if (typeof sendButton.click === 'function') {
+          sendButton.click();
+        } else {
+          sendButton.dispatchEvent(
+            new MouseEvent('click', {
+              bubbles: true,
+              cancelable: true,
+              view: window
+            })
+          );
+        }
+        return confirmSubmission('clicked_send_button');
+      }
+      input.focus();
+      const keyboardEventInit = {
+        bubbles: true,
+        cancelable: true,
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13
+      };
+      input.dispatchEvent(new KeyboardEvent('keydown', keyboardEventInit));
+      input.dispatchEvent(new KeyboardEvent('keypress', keyboardEventInit));
+      input.dispatchEvent(new KeyboardEvent('keyup', keyboardEventInit));
+      return confirmSubmission('pressed_enter');
+    })();`;
+  }
+
+  private buildComposerSubmissionStateScript(): string {
+    const submitButtonMatcher = isLikelyComposerSubmitButton
+      .toString()
+      .replace(/^function\s+isLikelyComposerSubmitButton/, "function isLikelyComposerSubmitButton");
+
+    return `(() => {
+      ${submitButtonMatcher}
+      const readConversationFingerprint = () => {
+        const units = Array.from(document.querySelectorAll('[data-content-search-unit-key]'))
+          .filter((node) => node instanceof HTMLElement)
+          .map((node) => {
+            if (!(node instanceof HTMLElement)) {
+              return null;
+            }
+            const rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) {
+              return null;
+            }
+            return node;
+          })
+          .filter((node) => node instanceof HTMLElement);
+        const latestUnit = units.at(-1);
+        return {
+          latestUnitKey:
+            latestUnit instanceof HTMLElement
+              ? latestUnit.getAttribute('data-content-search-unit-key')
+              : null,
+          latestSnippet:
+            latestUnit instanceof HTMLElement
+              ? (latestUnit.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200)
+              : null,
+          unitCount: units.length
+        };
+      };
+      const isSameConversationFingerprint = (left, right) =>
+        Boolean(left && right)
+        && left.latestUnitKey === right.latestUnitKey
+        && left.latestSnippet === right.latestSnippet
+        && left.unitCount === right.unitCount;
+      const selectors = [
+        '[data-codex-composer="true"]',
+        'textarea',
+        'input[type="text"]',
+        '[contenteditable="true"]',
+        '[role="textbox"]'
+      ];
+      const inputCandidates = selectors
+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+        .filter((candidate) => {
+          if (!(candidate instanceof HTMLElement)) {
+            return false;
+          }
+          if (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true') {
+            return false;
+          }
+          const rect = candidate.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      const activeElement = document.activeElement;
+      const input =
+        activeElement instanceof HTMLElement && inputCandidates.includes(activeElement)
+          ? activeElement
+          : (inputCandidates
+              .sort((left, right) => right.getBoundingClientRect().y - left.getBoundingClientRect().y)
+              .at(0) ?? null);
+      if (!(input instanceof HTMLElement)) {
+        return { submitted: false, reason: 'input_not_found' };
+      }
+      const inputRect = input.getBoundingClientRect();
+      const resolveComposerSubmitButton = (allowDisabled) =>
+        Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter((candidate) => {
+            if (!(candidate instanceof HTMLElement)) {
+              return false;
+            }
+            const rect = candidate.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) {
+              return false;
+            }
+            if (
+              !allowDisabled
+              && (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true')
+            ) {
+              return false;
+            }
+            const centerX = rect.x + rect.width / 2;
+            const centerY = rect.y + rect.height / 2;
+            return (
+              centerX >= inputRect.right - 140
+              && centerY >= inputRect.y - 24
+              && centerY <= inputRect.bottom + 40
+            );
+          })
+          .sort((left, right) => {
+            const leftRect = left.getBoundingClientRect();
+            const rightRect = right.getBoundingClientRect();
+            const leftLabel = {
+              text: left.textContent ?? '',
+              aria: left.getAttribute('aria-label'),
+              title: left.getAttribute('title'),
+              className: left.className ?? ''
+            };
+            const rightLabel = {
+              text: right.textContent ?? '',
+              aria: right.getAttribute('aria-label'),
+              title: right.getAttribute('title'),
+              className: right.className ?? ''
+            };
+            const leftStrictScore = isLikelyComposerSubmitButton(leftLabel) ? 1000 : 0;
+            const rightStrictScore = isLikelyComposerSubmitButton(rightLabel) ? 1000 : 0;
+            const leftPrimaryScore = /\bsize-token-button-composer\b/i.test(leftLabel.className) ? 100 : 0;
+            const rightPrimaryScore = /\bsize-token-button-composer\b/i.test(rightLabel.className) ? 100 : 0;
+            const leftScore =
+              leftStrictScore + leftPrimaryScore + leftRect.x - Math.abs(leftRect.y - inputRect.bottom);
+            const rightScore =
+              rightStrictScore + rightPrimaryScore + rightRect.x - Math.abs(rightRect.y - inputRect.bottom);
+            return rightScore - leftScore;
+          })
+          .at(0) ?? null;
+      const currentText =
+        'value' in input && typeof input.value === 'string'
+          ? input.value.trim()
+          : (input.textContent || '').trim();
+      const sendButton = resolveComposerSubmitButton(true);
+      const buttonHtml = sendButton instanceof HTMLElement ? sendButton.innerHTML : '';
+      const buttonClassName = sendButton instanceof HTMLElement ? String(sendButton.className || '') : '';
+      const baselineButtonHtml =
+        typeof window.__qqCodexLastSubmitButtonHtml === 'string'
+          ? window.__qqCodexLastSubmitButtonHtml
+          : '';
+      const isStreamingButton = baselineButtonHtml !== '' && buttonHtml !== '' && baselineButtonHtml !== buttonHtml;
+      const baselineConversationFingerprint = window.__qqCodexLastSubmitConversationFingerprint;
+      const currentConversationFingerprint = readConversationFingerprint();
+      const conversationAdvanced =
+        baselineConversationFingerprint
+        && !isSameConversationFingerprint(
+          baselineConversationFingerprint,
+          currentConversationFingerprint
+        );
+      return {
+        submitted: currentText.length === 0 || isStreamingButton || conversationAdvanced,
+        reason: currentText.length === 0
+          ? 'composer_cleared'
+          : (
+              isStreamingButton
+                ? 'entered_streaming_state'
+                : (conversationAdvanced ? 'conversation_advanced' : 'submit_not_confirmed')
+            ),
+        diagnostics: {
+          currentTextLength: currentText.length,
+          inputRect: {
+            x: inputRect.x,
+            y: inputRect.y,
+            width: inputRect.width,
+            height: inputRect.height,
+            right: inputRect.right,
+            bottom: inputRect.bottom
+          },
+          baselineButtonHtml: baselineButtonHtml.slice(0, 160),
+          buttonHtml: buttonHtml.slice(0, 160),
+          buttonClassName,
+          sendButtonFound: Boolean(sendButton),
+          conversationAdvanced
+        }
+      };
+    })();`;
+  }
+
+  private buildReadControlStateScript(): string {
+    return `
+      (() => {
+        const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+        const modelPattern = /(?:gpt|o1|o3|o4|4\\.1|4\\.5|5\\.4|mini|nano|sonnet|haiku|opus|gemini|claude|qwen|deepseek)/i;
+        const effortPattern = /^(?:低|中|高|minimal|low|medium|high)$/i;
+        const permissionPattern = /(?:访问权限|permission|sandbox)/i;
+        const workspacePattern = /^(?:本地工作|在本地处理|本地项目|本地|云端|local|cloud|worktree)$/i;
+        const branchPattern = /^(?:[A-Za-z0-9._-]+\\/[A-Za-z0-9._/-]+|main|master|develop|development|dev|staging|production|release\\/[A-Za-z0-9._/-]+|hotfix\\/[A-Za-z0-9._/-]+|feature\\/[A-Za-z0-9._/-]+|bugfix\\/[A-Za-z0-9._/-]+)$/;
+        const ignoredLinePattern = /(?:QQBOT_RUNTIME_CONTEXT|<qqmedia>|<!--|-->|会话类型|runtime\\/media|内部实现|相对路径)/i;
+        const ignoredBranchPattern = /^(?:https?:\\/\\/|app:\\/\\/|\\/|继续使用|在本地处理|本地工作|本地项目|升级至\\s*Pro|了解更多|移至工作树|剩余额度|remaining usage|quota|usage|额度|配额|GPT-|Claude|Gemini|完全访问权限|听写)$/i;
+        const isVisible = (node) => {
+          if (!(node instanceof HTMLElement)) {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+        const clickNode = (node) => {
+          node.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        };
+        const collectControls = () =>
+          Array.from(document.querySelectorAll('button,[role="button"],[role="menuitem"],[role="option"],[aria-label]'))
+            .filter(isVisible)
+            .map((node) => {
+              const rect = node instanceof HTMLElement ? node.getBoundingClientRect() : null;
+              return {
+                node,
+                text: normalize(node.textContent || ''),
+                aria: normalize(node.getAttribute('aria-label') || ''),
+                title: normalize(node.getAttribute('title') || ''),
+                className: String(node.className || ''),
+                x: rect ? rect.x : 0,
+                y: rect ? rect.y : 0,
+                width: rect ? rect.width : 0,
+                height: rect ? rect.height : 0
+              };
+            });
+        const collectFooterControls = () =>
+          collectControls()
+            .filter((item) => {
+              const text = item.text || item.aria || item.title;
+              if (!text) {
+                return false;
+              }
+
+              if (item.y < window.innerHeight - 120 || item.y > window.innerHeight || item.x < 380) {
+                return false;
+              }
+
+              return /(?:h-token-button-composer|size-token-button-composer)/.test(item.className);
+            })
+            .sort((left, right) => (left.y - right.y) || (left.x - right.x));
+        const getBodyLines = () =>
+          (document.body ? document.body.innerText : '')
+            .split('\\n')
+            .map((line) => normalize(line))
+            .filter((line) => line && !ignoredLinePattern.test(line));
+        const isQuotaHeader = (line) => line === '剩余额度' || /^remaining usage$/i.test(line);
+        const parseQuotaEntries = (lines) => {
+          const entries = [];
+          for (let index = 0; index < lines.length; index += 1) {
+            const line = lines[index];
+            if (
+              !line ||
+              isQuotaHeader(line) ||
+              /^\\d+%$/.test(line) ||
+              /^(?:继续使用|本地项目|本地工作|在本地处理|云端|升级至\\s*Pro|了解更多|移至工作树)$/i.test(line)
+            ) {
+              continue;
+            }
+
+            const combinedMatch = line.match(/^(.+?(?:分钟|小时|天|周|月|minutes?|hours?|days?|weeks?|months?))\\s+(\\d+%)\\s+(.+)$/i);
+            if (combinedMatch) {
+              entries.push(\`\${combinedMatch[1]} \${combinedMatch[2]}（\${combinedMatch[3]} 重置）\`);
+              continue;
+            }
+
+            const timeframeMatch = line.match(/^(.+?(?:分钟|小时|天|周|月|minutes?|hours?|days?|weeks?|months?))$/i);
+            if (timeframeMatch && index + 2 < lines.length) {
+              const percentLine = lines[index + 1];
+              const resetLine = lines[index + 2];
+              if (/^\\d+%$/.test(percentLine) && resetLine) {
+                entries.push(\`\${timeframeMatch[1]} \${percentLine}（\${resetLine} 重置）\`);
+                index += 2;
+              }
+            }
+          }
+
+          return entries;
+        };
+        const parseBranch = (lines) =>
+          lines.find((line) => branchPattern.test(line) && !ignoredBranchPattern.test(line)) || null;
+        const findWorkspaceButton = (controls) =>
+          controls.find((item) => workspacePattern.test(item.text || item.aria || item.title));
+        const findFooterBranch = (controls) =>
+          controls.find((item) => {
+            const text = item.text || item.aria || item.title;
+            return branchPattern.test(text) && !ignoredBranchPattern.test(text);
+          });
+        const readState = () => {
+          const footerControls = collectFooterControls();
+          const workspaceButton = findWorkspaceButton(footerControls);
+          const footerBranch = findFooterBranch(footerControls);
+          const lines = getBodyLines();
+          const quotaEntries = parseQuotaEntries(lines);
+
+          let model = null;
+          let reasoningEffort = null;
+          let workspace = null;
+          let permissionMode = null;
+
+          for (const item of footerControls) {
+            const text = item.text || item.aria || item.title;
+            if (!model && modelPattern.test(text)) {
+              model = text;
+              continue;
+            }
+            if (!reasoningEffort && effortPattern.test(text)) {
+              reasoningEffort = text;
+              continue;
+            }
+            if (!permissionMode && permissionPattern.test(text)) {
+              permissionMode = text;
+              continue;
+            }
+            if (!workspace && workspacePattern.test(text)) {
+              workspace = text;
+            }
+          }
+
+          return {
+            workspaceButton,
+            state: {
+              model,
+              reasoningEffort,
+              workspace,
+              branch: footerBranch ? (footerBranch.text || footerBranch.aria || footerBranch.title) : parseBranch(lines),
+              permissionMode,
+              quotaSummary: quotaEntries.length > 0 ? quotaEntries.join('\\n') : null
+            }
+          };
+        };
+
+        return new Promise((resolve) => {
+          const initial = readState();
+          if (!initial.workspaceButton) {
+            resolve(initial.state);
+            return;
+          }
+
+          clickNode(initial.workspaceButton.node);
+          setTimeout(() => {
+            const opened = readState();
+            const quotaToggle = collectControls().find((item) => /剩余额度|remaining usage/i.test(item.text || item.aria || item.title));
+            if (!(quotaToggle && quotaToggle.node instanceof HTMLElement)) {
+              resolve(opened.state);
+              return;
+            }
+
+            clickNode(quotaToggle.node);
+            setTimeout(() => {
+              resolve(readState().state);
+            }, 120);
+          }, 120);
+        });
+      })()
+    `;
+  }
+
+  private buildReadQuotaSummaryScript(): string {
+    return `
+      (() => {
+        const normalize = (value) =>
+          (value || '')
+            .replace(/[\\u200B-\\u200D\\uFEFF]/g, '')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const clickNode = (node) => {
+          node.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        };
+        const collectControls = () =>
+          Array.from(document.querySelectorAll('button,[role="button"],[role="menuitem"],[role="option"],[aria-label]'));
+        const getText = (node) =>
+          normalize(node.textContent || node.getAttribute('aria-label') || node.getAttribute('title') || '');
+        const isQuotaHeader = (line) => line === '剩余额度' || /^remaining usage$/i.test(line);
+        const parseQuotaEntries = (lines) => {
+          const entries = [];
+          for (let index = 0; index < lines.length; index += 1) {
+            const line = lines[index];
+            if (
+              !line ||
+              isQuotaHeader(line) ||
+              /^\\d+%$/.test(line) ||
+              /^(?:继续使用|本地项目|云端|升级至\\s*Pro|了解更多|移至工作树)$/i.test(line)
+            ) {
+              continue;
+            }
+
+            const combinedMatch = line.match(/^(.+?(?:分钟|小时|天|周|月|minutes?|hours?|days?|weeks?|months?))\\s+(\\d+%)\\s+(.+)$/i);
+            if (combinedMatch) {
+              entries.push(\`\${combinedMatch[1]} \${combinedMatch[2]}（\${combinedMatch[3]} 重置）\`);
+              continue;
+            }
+
+            const timeframeMatch = line.match(/^(.+?(?:分钟|小时|天|周|月|minutes?|hours?|days?|weeks?|months?))$/i);
+            if (timeframeMatch && index + 2 < lines.length) {
+              const percentLine = lines[index + 1];
+              const resetLine = lines[index + 2];
+              if (/^\\d+%$/.test(percentLine) && resetLine) {
+                entries.push(\`\${timeframeMatch[1]} \${percentLine}（\${resetLine} 重置）\`);
+                index += 2;
+                continue;
+              }
+            }
+          }
+
+          return entries;
+        };
+
+        const findModeButton = () =>
+          collectControls().find((node) => {
+            if (!(node instanceof HTMLElement)) {
+              return false;
+            }
+            const text = getText(node);
+            const rect = node.getBoundingClientRect();
+            return (
+              rect.y >= window.innerHeight - 120 &&
+              rect.height <= 40 &&
+              rect.width <= 140 &&
+              /^(?:本地工作|在本地处理|本地项目|本地|云端|local|cloud|worktree)(?:\\d+%)?$/i.test(text)
+            );
+          });
+
+        const modeButton = findModeButton();
+        if (!modeButton) {
+          return null;
+        }
+
+        const readVisibleQuotaSummary = () => {
+          const lines = (document.body ? document.body.innerText : '')
+            .split('\\n')
+            .map((line) => normalize(line))
+            .filter(Boolean);
+          const quotaIndex = lines.findIndex((line) => isQuotaHeader(line));
+          if (quotaIndex < 0) {
+            return null;
+          }
+
+          const quotaBlock = lines.slice(quotaIndex, quotaIndex + 10);
+          const entries = parseQuotaEntries(quotaBlock);
+          return entries.length > 0 ? entries.join('\\n') : null;
+        };
+
+        const ensureQuotaVisible = () =>
+          new Promise((resolve) => {
+            let attempts = 0;
+            let openedMenu = false;
+            let expandedQuota = false;
+            const tick = () => {
+              attempts += 1;
+              const summary = readVisibleQuotaSummary();
+              if (summary) {
+                resolve(summary);
+                return;
+              }
+
+              if (!openedMenu) {
+                clickNode(modeButton);
+                openedMenu = true;
+              }
+
+              const quotaToggle = collectControls().find((node) => /剩余额度|remaining usage/i.test(getText(node)));
+              if (quotaToggle && !expandedQuota) {
+                clickNode(quotaToggle);
+                expandedQuota = true;
+              }
+
+              if (attempts >= 8) {
+                resolve(null);
+                return;
+              }
+
+              setTimeout(tick, 80);
+            };
+
+            tick();
+          });
+
+        return ensureQuotaVisible();
+      })()
+    `;
+  }
+
+  private buildSwitchModelScript(targetModel: string): string {
+    return `
+      (() => {
+        const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const target = ${JSON.stringify(targetModel)}.trim();
+        const targetNormalized = normalize(target);
+        const matchesModelText = (text) => /(?:gpt|o1|o3|o4|4\\.1|4\\.5|5\\.4|mini|nano|sonnet|haiku|opus|gemini|claude|qwen|deepseek)/i.test(text);
+        const collectControls = () =>
+          Array.from(document.querySelectorAll('button,[role="button"],[role="menuitem"],[role="option"],[aria-label]'));
+        const findModelButton = () =>
+          collectControls().find((node) => {
+            if (!(node instanceof HTMLElement)) {
+              return false;
+            }
+            const rect = node.getBoundingClientRect();
+            const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
+            return rect.y >= window.innerHeight - 200 && matchesModelText(text);
+          });
+        const clickNode = (node) => {
+          node.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        };
+        const modelButton = findModelButton();
+        if (!modelButton) {
+          return { ok: false, reason: 'model_button_not_found' };
+        }
+        clickNode(modelButton);
+
+        return new Promise((resolve) => {
+          let attempts = 0;
+          const tick = () => {
+            attempts += 1;
+            const option = collectControls().find((node) => {
+              const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (!text) {
+                return false;
+              }
+              const normalized = normalize(text);
+              return normalized === targetNormalized || normalized.includes(targetNormalized);
+            });
+
+            if (option) {
+              clickNode(option);
+              resolve({ ok: true });
+              return;
+            }
+
+            if (attempts >= 20) {
+              resolve({ ok: false, reason: 'model_option_not_found' });
+              return;
+            }
+
+            setTimeout(tick, 50);
+          };
+
+          tick();
+        });
+      })()
+    `;
+  }
+
+  private buildAssistantReplyProbeScript(): string {
+    return `(() => {
+      const allAssistantUnits = Array.from(
+        document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')
+      );
+      const composer = document.querySelector(
+        '[data-codex-composer="true"], textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'
+      );
+      const composerRect = composer instanceof HTMLElement
+        ? composer.getBoundingClientRect()
+        : null;
+      const visibleAssistantUnits = allAssistantUnits
+        .filter((node) => node instanceof HTMLElement)
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.bottom >= -120 &&
+            rect.top <= window.innerHeight + 480
+          );
+        });
+      const viewportAnchoredAssistantUnits = visibleAssistantUnits.filter((node) => {
+        if (!(node instanceof HTMLElement) || !composerRect) {
+          return true;
+        }
+        const rect = node.getBoundingClientRect();
+        return (
+          rect.bottom >= composerRect.top - window.innerHeight * 0.75 &&
+          rect.top <= composerRect.bottom + window.innerHeight
+        );
+      });
+      const candidateAssistantUnits =
+        viewportAnchoredAssistantUnits.length > 0
+          ? viewportAnchoredAssistantUnits
+          : (visibleAssistantUnits.length > 0 ? visibleAssistantUnits : allAssistantUnits);
+      const latestAssistantUnit = candidateAssistantUnits
+        .filter((node) => node instanceof HTMLElement)
+        .sort((left, right) => {
+          const leftRect = left.getBoundingClientRect();
+          const rightRect = right.getBoundingClientRect();
+          return rightRect.bottom - leftRect.bottom;
+        })
+        .at(0);
+      if (!(latestAssistantUnit instanceof HTMLElement)) {
+        return null;
+      }
+      const normalizeReference = (value) => {
+        if (!value || typeof value !== 'string') {
+          return null;
+        }
+        if (value.startsWith('file://')) {
+          try {
+            return decodeURIComponent(new URL(value).pathname);
+          } catch {
+            return value;
+          }
+        }
+        if (
+          value.startsWith('http://') ||
+          value.startsWith('https://') ||
+          value.startsWith('/') ||
+          value.startsWith('data:')
+        ) {
+          return value;
+        }
+        return null;
+      };
+      const isLocalReference = (value) =>
+        typeof value === 'string' &&
+        (
+          value.startsWith('/') ||
+          value.startsWith('./') ||
+          value.startsWith('../') ||
+          /^[A-Za-z]:[\\\\/]/.test(value)
+        );
+      const serializeRichContent = (root) => {
+        const clone = root.cloneNode(true);
+        if (!(clone instanceof HTMLElement)) {
+          return root.innerText.trim();
+        }
+        clone.querySelectorAll('a[href]').forEach((link) => {
+          if (!(link instanceof HTMLAnchorElement)) {
+            return;
+          }
+          const href = normalizeReference(link.href) || link.getAttribute('href') || '';
+          const text = (link.textContent || '').trim();
+          const replacement = href && text && text !== href
+            ? text + '\\n' + href
+            : (href || text);
+          link.textContent = replacement;
+        });
+        const serializeNode = (node, listContext) => {
+          if (node instanceof HTMLBRElement) {
+            return '\\n';
+          }
+          if (node.nodeType === Node.TEXT_NODE) {
+            return node.textContent || '';
+          }
+          if (!(node instanceof HTMLElement)) {
+            return '';
+          }
+
+          const tagName = node.tagName;
+          if (
+            tagName === 'DIV' &&
+            typeof node.className === 'string' &&
+            node.className.includes('bg-token-text-code-block-background')
+          ) {
+            const codeElement = node.querySelector('code');
+            if (codeElement instanceof HTMLElement) {
+              const codeSource = codeElement.innerText || '';
+              const normalizedCode = codeSource
+                .replace(/\\r\\n/g, '\\n')
+                .replace(/\\u00a0/g, ' ')
+                .replace(/\\n+$/g, '');
+              if (normalizedCode.trim()) {
+                const languageNode = node.querySelector('.min-w-0.truncate');
+                const languageText = languageNode instanceof HTMLElement
+                  ? (languageNode.textContent || '').trim()
+                  : '';
+                const language = /^[A-Za-z0-9_+#.-]{1,24}$/.test(languageText) ? languageText : '';
+                return '\`\`\`' + language + '\\n' + normalizedCode + '\\n\`\`\`' + '\\n';
+              }
+            }
+          }
+
+          if (tagName === 'PRE') {
+            const codeElement = node.querySelector('code');
+            const codeSource = codeElement instanceof HTMLElement ? codeElement.innerText : node.innerText;
+            const normalizedCode = (codeSource || '')
+              .replace(/\\r\\n/g, '\\n')
+              .replace(/\\u00a0/g, ' ')
+              .replace(/\\n+$/g, '');
+            if (!normalizedCode.trim()) {
+              return '';
+            }
+
+            let language = '';
+            if (codeElement instanceof HTMLElement) {
+              const classNames = Array.from(codeElement.classList.values());
+              const languageClass = classNames.find((value) => /^language[-:]/i.test(value));
+              if (languageClass) {
+                language = languageClass.replace(/^language[-:]/i, '').trim();
+              }
+            }
+
+            const lines = normalizedCode.split('\\n');
+            if (!language && lines.length > 1) {
+              const firstLine = lines[0].trim();
+              if (/^[A-Za-z0-9_+#.-]{1,24}$/.test(firstLine)) {
+                language = firstLine;
+                lines.shift();
+              }
+            }
+
+            const fencedBody = lines.join('\\n').replace(/\\n+$/g, '');
+            return '\`\`\`' + language + '\\n' + fencedBody + '\\n\`\`\`' + '\\n';
+          }
+
+          if (tagName === 'TABLE') {
+            const rows = Array.from(node.querySelectorAll('tr'))
+              .map((row) =>
+                Array.from(row.querySelectorAll('th, td'))
+                  .map((cell) => (cell.textContent || '').replace(/\\s+/g, ' ').trim())
+              )
+              .filter((cells) => cells.length > 0);
+            if (!rows.length) {
+              return '';
+            }
+
+            const header = rows[0];
+            const separator = header.map(() => '---');
+            const bodyRows = rows.slice(1);
+            const markdownRows = [
+              '| ' + header.join(' | ') + ' |',
+              '| ' + separator.join(' | ') + ' |',
+              ...bodyRows.map((cells) => '| ' + cells.join(' | ') + ' |')
+            ];
+            return markdownRows.join('\\n') + '\\n';
+          }
+
+          if (tagName === 'OL') {
+            return Array.from(node.children)
+              .map((child, index) => serializeNode(child, { type: 'ol', index }))
+              .filter(Boolean)
+              .join('\\n');
+          }
+
+          if (tagName === 'UL') {
+            return Array.from(node.children)
+              .map((child) => serializeNode(child, { type: 'ul' }))
+              .filter(Boolean)
+              .join('\\n');
+          }
+
+          if (tagName === 'LI') {
+            const content = Array.from(node.childNodes)
+              .map((child) => serializeNode(child, null))
+              .join('')
+              .replace(/\\s+\\n/g, '\\n')
+              .replace(/\\n\\s+/g, '\\n')
+              .replace(/[ \\t]+/g, ' ')
+              .trim();
+            if (!content) {
+              return '';
+            }
+            if (listContext?.type === 'ol') {
+              const index = typeof listContext.index === 'number' ? listContext.index : 0;
+              return String(index + 1) + '. ' + content;
+            }
+            return '- ' + content;
+          }
+
+          const serializedChildren = Array.from(node.childNodes)
+            .map((child) => serializeNode(child, null))
+            .join('');
+          if (['P', 'DIV', 'SECTION', 'ARTICLE', 'BLOCKQUOTE'].includes(tagName)) {
+            return serializedChildren.trim() ? serializedChildren.trim() + '\\n' : '';
+          }
+          return serializedChildren;
+        };
+        return serializeNode(clone, null)
+          .replace(/[ \\t]+\\n/g, '\\n')
+          .replace(/\\n{3,}/g, '\\n\\n')
+          .trim();
+      };
+      const mediaReferences = Array.from(
+        latestAssistantUnit.querySelectorAll('img[src], audio[src], audio source[src], video[src], video source[src], a[href]')
+      )
+        .map((node) => {
+          if (!(node instanceof HTMLElement)) {
+            return null;
+          }
+          if ('src' in node && typeof node.src === 'string' && node.src) {
+            return normalizeReference(node.src);
+          }
+          if ('href' in node && typeof node.href === 'string' && node.href) {
+            const normalizedHref = normalizeReference(node.href);
+            return normalizedHref && isLocalReference(normalizedHref)
+              ? normalizedHref
+              : null;
+          }
+          return null;
+        })
+        .filter((value, index, values) => typeof value === 'string' && values.indexOf(value) === index);
+      const streamingMatcher = /(\\bstop\\b|\\bthinking\\b|\\bworking\\b|\\brunning\\b|停止|中止|取消|思考中|生成中)/i;
+      const assistantStatusMatcher = /(Reconnecting\\.{3}|Searching\\.{3}|Running\\.{3}|Working\\.{3}|连接中\\.{0,3}|重新连接中\\.{0,3}|搜索中\\.{0,3}|执行中\\.{0,3}|处理中\\.{0,3})/i;
+      const isComposerBusyButton = (node) => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const className = String(node.className || '');
+        if (!className.includes('size-token-button-composer')) {
+          return false;
+        }
+        const html = node.innerHTML || '';
+        return html.includes('M4.5 5.75C4.5 5.05964')
+          || html.includes('M4.5 5.75C4.5 5.0596');
+      };
+      const isStreaming = Array.from(document.querySelectorAll('button, [role="button"], [aria-busy="true"]'))
+        .some((node) => {
+          if (!(node instanceof HTMLElement)) {
+            return false;
+          }
+          const rect = node.getBoundingClientRect();
+          const isNearComposer = composerRect
+            ? rect.y >= composerRect.y - 48 && rect.y <= composerRect.bottom + 48
+            : rect.y >= window.innerHeight - 160;
+          if (node.getAttribute('aria-busy') === 'true') {
+            return true;
+          }
+          if (isComposerBusyButton(node)) {
+            return true;
+          }
+          if (!isNearComposer) {
+            return false;
+          }
+          const label = [
+            node.textContent || '',
+            node.getAttribute('aria-label') || '',
+            node.getAttribute('title') || ''
+          ].join(' ').trim();
+          return streamingMatcher.test(label);
+        });
+      const assistantStatusText = Array.from(
+        latestAssistantUnit.querySelectorAll('.text-xs, [aria-live], [data-state], [class*="status"], [class*="loading"]')
+      )
+        .map((node) => (node instanceof HTMLElement ? node.innerText || '' : ''))
+        .join('\\n');
+      const hasAssistantActivity = assistantStatusMatcher.test(assistantStatusText)
+        || assistantStatusMatcher.test(latestAssistantUnit.innerText || '');
+
+      const richContent = latestAssistantUnit.querySelector('[class*="_markdownContent_"]');
+      if (richContent instanceof HTMLElement) {
+        const text = serializeRichContent(richContent);
+        if (text) {
+          return {
+            unitKey: latestAssistantUnit.getAttribute('data-content-search-unit-key'),
+            reply: text,
+            mediaReferences,
+            isStreaming: isStreaming || hasAssistantActivity
+          };
+        }
+      }
+
+      const sanitizedUnit = latestAssistantUnit.cloneNode(true);
+      if (!(sanitizedUnit instanceof HTMLElement)) {
+        return null;
+      }
+      sanitizedUnit
+        .querySelectorAll('button, [role="button"], [aria-label], .text-xs')
+        .forEach((node) => node.remove());
+      const text = sanitizedUnit.innerText
+        .split('\\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join('\\n')
+        .trim();
+      return text || mediaReferences.length > 0
+        ? {
+            unitKey: latestAssistantUnit.getAttribute('data-content-search-unit-key'),
+            reply: text || null,
+            mediaReferences,
+            isStreaming: isStreaming || hasAssistantActivity
+          }
+        : null;
+    })();`;
+  }
+
+  private buildConversationViewportFingerprintProbeScript(): string {
+    return `(() => {
+      const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+      const units = Array.from(document.querySelectorAll('[data-content-search-unit-key]'))
+        .filter((node) => node instanceof HTMLElement)
+        .map((node) => {
+          if (!(node instanceof HTMLElement)) {
+            return null;
+          }
+          const rect = node.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) {
+            return null;
+          }
+          return node;
+        })
+        .filter((node) => node instanceof HTMLElement);
+      const latestUnit = units.at(-1);
+      if (!(latestUnit instanceof HTMLElement)) {
+        return {
+          latestUnitKey: null,
+          latestSnippet: null,
+          unitCount: 0
+        };
+      }
+      const snippet = normalize(latestUnit.innerText)
+        .slice(0, 200);
+      return {
+        latestUnitKey: latestUnit.getAttribute('data-content-search-unit-key'),
+        latestSnippet: snippet || null,
+        unitCount: units.length
+      };
+    })();`;
+  }
+}
+
+function buildMediaArtifactFromReference(reference: string): MediaArtifact {
+  const normalizedReference = reference.trim();
+  const strippedReference = normalizedReference.split("?")[0] ?? normalizedReference;
+  const lowerReference = strippedReference.toLowerCase();
+  const originalName = inferOriginalName(strippedReference);
+  const mimeType = inferMimeType(lowerReference);
+
+  return {
+    kind: inferMediaArtifactKind(lowerReference, mimeType),
+    sourceUrl: normalizedReference,
+    localPath: normalizedReference,
+    mimeType,
+    fileSize: 0,
+    originalName
+  };
+}
+
+function inferMediaArtifactKind(reference: string, mimeType: string): MediaArtifactKind {
+  if (mimeType.startsWith("image/") || /\.(png|jpg|jpeg|gif|webp|bmp)$/i.test(reference)) {
+    return MediaArtifactKind.Image;
+  }
+
+  if (mimeType.startsWith("audio/") || /\.(mp3|wav|ogg|aac|flac|silk)$/i.test(reference)) {
+    return MediaArtifactKind.Audio;
+  }
+
+  if (mimeType.startsWith("video/") || /\.(mp4|mov|avi|mkv|webm)$/i.test(reference)) {
+    return MediaArtifactKind.Video;
+  }
+
+  return MediaArtifactKind.File;
+}
+
+function inferMimeType(reference: string): string {
+  if (reference.startsWith("data:image/")) {
+    const match = reference.match(/^data:(image\/[^;]+);/i);
+    return match?.[1] ?? "image/png";
+  }
+
+  if (/\.png$/i.test(reference)) return "image/png";
+  if (/\.(jpg|jpeg)$/i.test(reference)) return "image/jpeg";
+  if (/\.gif$/i.test(reference)) return "image/gif";
+  if (/\.webp$/i.test(reference)) return "image/webp";
+  if (/\.bmp$/i.test(reference)) return "image/bmp";
+  if (/\.mp3$/i.test(reference)) return "audio/mpeg";
+  if (/\.wav$/i.test(reference)) return "audio/wav";
+  if (/\.ogg$/i.test(reference)) return "audio/ogg";
+  if (/\.aac$/i.test(reference)) return "audio/aac";
+  if (/\.flac$/i.test(reference)) return "audio/flac";
+  if (/\.silk$/i.test(reference)) return "audio/silk";
+  if (/\.mp4$/i.test(reference)) return "video/mp4";
+  if (/\.mov$/i.test(reference)) return "video/quicktime";
+  if (/\.avi$/i.test(reference)) return "video/x-msvideo";
+  if (/\.mkv$/i.test(reference)) return "video/x-matroska";
+  if (/\.webm$/i.test(reference)) return "video/webm";
+  if (/\.pdf$/i.test(reference)) return "application/pdf";
+  return "application/octet-stream";
+}
+
+function inferOriginalName(reference: string): string {
+  try {
+    if (reference.startsWith("data:image/")) {
+      return "codex-inline-image";
+    }
+
+    const url = reference.startsWith("http://") || reference.startsWith("https://")
+      ? new URL(reference)
+      : null;
+    const pathname = url?.pathname ?? reference;
+    const segments = pathname.split("/");
+    return segments.at(-1) || "codex-media";
+  } catch {
+    const segments = reference.split("/");
+    return segments.at(-1) || "codex-media";
+  }
+}
