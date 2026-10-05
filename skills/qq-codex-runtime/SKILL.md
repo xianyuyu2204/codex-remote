@@ -1,7 +1,7 @@
 ---
 name: qq-codex-runtime
-description: 启动、验证和排查 codex-desktop-orchestrator 运行时。适用于检查 QQ gateway WebSocket、Codex Desktop 远程调试端口、SQLite 会话绑定、真实消息收发链路等场景。
-metadata: {"codex":{"emoji":"🛠️","repo":"codex-desktop-orchestrator"}}
+description: 启动、验证和排查 codex-remote 运行时。适用于检查 QQ gateway WebSocket、Codex Desktop 远程调试端口、SQLite 会话绑定、真实消息收发链路等场景。
+metadata: {"codex":{"emoji":"🛠️","repo":"codex-remote"}}
 ---
 
 # QQ Codex 运行时排障
@@ -20,15 +20,15 @@ metadata: {"codex":{"emoji":"🛠️","repo":"codex-desktop-orchestrator"}}
 ## 启动步骤
 
 ```bash
-cd /path/to/codex-desktop-orchestrator
+cd /path/to/codex-remote
 pnpm dev
 ```
 
 预期日志：
 
 ```text
-[codex-desktop-orchestrator] codex desktop ready { launched: true|false, remoteDebuggingPort: 9229 }
-[codex-desktop-orchestrator] ready { transport: 'qq-gateway-websocket', accountKey: 'qqbot:default' }
+[codex-remote] codex desktop ready { launched: true|false, remoteDebuggingPort: 9229 }
+[codex-remote] ready { transport: 'qq-gateway-websocket', accountKey: 'qqbot:default' }
 ```
 
 ## 核心检查点
@@ -57,14 +57,14 @@ cat ./runtime/qq-gateway-session.json
 ### 3. SQLite 会话绑定
 
 ```bash
-sqlite3 ./runtime/codex-desktop-orchestrator.sqlite \
+sqlite3 ./runtime/codex-remote.sqlite \
   "select session_key, codex_thread_ref, status, last_error from bridge_sessions;"
 ```
 
 ### 4. 最近消息记录
 
 ```bash
-sqlite3 ./runtime/codex-desktop-orchestrator.sqlite \
+sqlite3 ./runtime/codex-remote.sqlite \
   "select session_key, message_id, received_at from message_ledger order by received_at desc limit 20;"
 ```
 

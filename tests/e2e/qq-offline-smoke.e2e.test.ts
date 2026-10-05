@@ -53,8 +53,8 @@ describe("qq bot offline smoke", () => {
     process.env.QQ_CODEX_ALLOWED_C2C_SENDERS = "OPENID_ALLOWED";
     process.env.QQ_CODEX_PROJECT_ALIASES_JSON = JSON.stringify({
       bridge: {
-        cwd: "D:/Project/github/codex-desktop-orchestrator",
-        label: "Codex Desktop Orchestrator"
+        cwd: "D:/Project/github/codex-remote",
+        label: "Codex Remote"
       }
     });
 
@@ -89,7 +89,7 @@ describe("qq bot offline smoke", () => {
         {
           index: 1,
           title: "Offline Thread",
-          projectName: "codex-desktop-orchestrator",
+          projectName: "codex-remote",
           relativeTime: "now",
           isCurrent: true,
           threadRef: "codex-app-thread:offline-thread:offline"
@@ -146,11 +146,11 @@ describe("qq bot offline smoke", () => {
       await ingress(qqMessage("/new bridge inspect offline flow", { messageId: "offline-new-1" }));
       expect(createdThreads).toEqual([
         expect.objectContaining({
-          cwd: "D:/Project/github/codex-desktop-orchestrator",
+          cwd: "D:/Project/github/codex-remote",
           seedPrompt: expect.stringContaining("inspect offline flow")
         })
       ]);
-      expect(delivered.at(-1)?.text).toContain("Created Codex thread for project: Codex Desktop Orchestrator");
+      expect(delivered.at(-1)?.text).toContain("Created Codex thread for project: Codex Remote");
 
       const session = await app.sessionStore.getSession("qqbot:default::qq:c2c:OPENID_ALLOWED");
       expect(session).toEqual(

@@ -39,7 +39,7 @@ export class SqliteThreadLockStore implements ThreadLockStorePort {
       try {
         await options?.onQueued?.();
       } catch (error) {
-        console.warn("[codex-desktop-orchestrator] thread queue notice failed", {
+        console.warn("[codex-remote] thread queue notice failed", {
           threadRef,
           error: error instanceof Error ? error.message : String(error)
         });
@@ -93,13 +93,13 @@ export class SqliteThreadLockStore implements ThreadLockStorePort {
               owner
             );
           if (renewed.changes === 0) {
-            console.warn("[codex-desktop-orchestrator] thread lock lease was lost", {
+            console.warn("[codex-remote] thread lock lease was lost", {
               threadRef,
               owner
             });
           }
         } catch (error) {
-          console.warn("[codex-desktop-orchestrator] thread lock lease renewal failed", {
+          console.warn("[codex-remote] thread lock lease renewal failed", {
             threadRef,
             owner,
             error: error instanceof Error ? error.message : String(error)

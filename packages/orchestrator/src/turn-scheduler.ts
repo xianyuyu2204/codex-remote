@@ -19,7 +19,7 @@ export class SessionTurnScheduler {
       try {
         await onQueued?.();
       } catch (error) {
-        console.warn("[codex-desktop-orchestrator] session queue notice failed", {
+        console.warn("[codex-remote] session queue notice failed", {
           sessionKey,
           error: error instanceof Error ? error.message : String(error)
         });

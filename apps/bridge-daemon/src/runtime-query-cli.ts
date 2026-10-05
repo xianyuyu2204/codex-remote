@@ -5,7 +5,7 @@ import { openReadonlySqliteDatabase } from "../../../packages/store/src/sqlite.j
 import { SqliteTurnStore } from "../../../packages/store/src/turn-repo.js";
 import { loadConfig } from "./config.js";
 
-const LOG_PREFIX = "[codex-desktop-orchestrator]";
+const LOG_PREFIX = "[codex-remote]";
 
 export async function runDataQueryCommand(
   command: "tasks" | "task" | "deliveries",

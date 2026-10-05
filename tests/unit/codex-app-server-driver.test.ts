@@ -125,8 +125,8 @@ describe("codex app-server driver", () => {
       method: "initialize",
       params: {
         clientInfo: {
-          name: "codex-desktop-orchestrator",
-          title: "Codex Desktop Orchestrator",
+          name: "codex-remote",
+          title: "Codex Remote",
           version: "0.0.1"
         }
       }
@@ -664,7 +664,7 @@ describe("codex app-server driver", () => {
         thread: {
           id: "thread-target",
           name: "目标线程",
-          cwd: "/Volumes/workspaces/codex-desktop-orchestrator",
+          cwd: "/Volumes/workspaces/codex-remote",
           updatedAt: Math.floor(Date.now() / 1000)
         }
       });
@@ -1768,7 +1768,7 @@ describe("codex app-server driver", () => {
         thread: {
           id: "thread-bound",
           name: "绑定线程",
-          cwd: "/Volumes/workspaces/codex-desktop-orchestrator",
+          cwd: "/Volumes/workspaces/codex-remote",
           updatedAt: Math.floor(Date.now() / 1000),
           gitInfo: {
             branch: "codex/weixin-multi-channel"
@@ -1813,10 +1813,10 @@ describe("codex app-server driver", () => {
 
     expect(state).toMatchObject({
       threadTitle: "绑定线程",
-      threadProjectName: "codex-desktop-orchestrator",
+      threadProjectName: "codex-remote",
       model: "gpt-5.4",
       reasoningEffort: "high",
-      workspace: "codex-desktop-orchestrator",
+      workspace: "codex-remote",
       branch: "codex/weixin-multi-channel",
       permissionMode: "reviewed / on-request / workspace-write / auto-review"
     });
@@ -1842,7 +1842,7 @@ describe("codex app-server driver", () => {
 
     logStderr("unexpected app-server stderr");
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] codex app-server stderr",
+      "[codex-remote] codex app-server stderr",
       { text: "unexpected app-server stderr" }
     );
 

@@ -67,7 +67,7 @@ describe("bridge daemon main", () => {
 
     await expect(handler(createMessage())).resolves.toBeUndefined();
     expect(errorSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] message handling failed",
+      "[codex-remote] message handling failed",
       expect.objectContaining({
         messageId: "msg-main-1",
         sessionKey: "qqbot:default::qq:c2c:abc-123",

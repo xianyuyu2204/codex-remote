@@ -1,7 +1,7 @@
 ---
 name: qq-codex-thread-management
 description: 管理 QQ 私聊与 Codex Desktop 真实线程的绑定。适用于查看最近线程、查看当前绑定、切换线程、新建线程、fork 最近几轮 QQ 对话到新线程等场景。
-metadata: {"codex":{"emoji":"🧵","repo":"codex-desktop-orchestrator"}}
+metadata: {"codex":{"emoji":"🧵","repo":"codex-remote"}}
 ---
 
 # QQ Codex 线程管理
@@ -21,15 +21,15 @@ metadata: {"codex":{"emoji":"🧵","repo":"codex-desktop-orchestrator"}}
 在执行线程管理前，先确认桥接正在运行：
 
 ```bash
-cd /path/to/codex-desktop-orchestrator
+cd /path/to/codex-remote
 pnpm dev
 ```
 
 启动成功时应出现类似日志：
 
 ```text
-[codex-desktop-orchestrator] codex desktop ready { launched: false, remoteDebuggingPort: 9229 }
-[codex-desktop-orchestrator] ready { transport: 'qq-gateway-websocket', accountKey: 'qqbot:default' }
+[codex-remote] codex desktop ready { launched: false, remoteDebuggingPort: 9229 }
+[codex-remote] ready { transport: 'qq-gateway-websocket', accountKey: 'qqbot:default' }
 ```
 
 ## QQ 私聊命令
@@ -94,7 +94,7 @@ pnpm dev
 查看会话绑定：
 
 ```bash
-sqlite3 ./runtime/codex-desktop-orchestrator.sqlite \
+sqlite3 ./runtime/codex-remote.sqlite \
   "select session_key, codex_thread_ref, status from bridge_sessions;"
 ```
 

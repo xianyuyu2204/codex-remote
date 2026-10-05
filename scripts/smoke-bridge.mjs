@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-desktop-orchestrator-smoke-"));
+const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-remote-smoke-"));
 const listenPort = await getFreePort();
 const cliPath = path.join(repoRoot, "dist", "apps", "bridge-daemon", "src", "cli.js");
 const childOutput = [];

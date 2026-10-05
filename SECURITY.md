@@ -1,6 +1,6 @@
 # Security Policy
 
-感谢你帮助 `codex-desktop-orchestrator` 提升安全性。
+感谢你帮助 `codex-remote` 提升安全性。
 
 ## Reporting a Vulnerability
 

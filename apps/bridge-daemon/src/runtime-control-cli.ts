@@ -5,7 +5,7 @@ import {
   runtimePaths
 } from "./runtime-state.js";
 
-const LOG_PREFIX = "[codex-desktop-orchestrator]";
+const LOG_PREFIX = "[codex-remote]";
 
 export async function guardSingleRuntimeInstance(options: {
   env: NodeJS.ProcessEnv;

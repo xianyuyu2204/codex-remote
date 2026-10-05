@@ -131,7 +131,7 @@ export class QqGateway implements QqIngressPort {
         return [result.value];
       }
 
-      console.error("[codex-desktop-orchestrator] qq attachment download failed", {
+      console.error("[codex-remote] qq attachment download failed", {
         error: result.reason instanceof Error ? result.reason.message : String(result.reason)
       });
       return [];

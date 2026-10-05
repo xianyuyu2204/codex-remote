@@ -1,4 +1,4 @@
-# codex-desktop-orchestrator
+# codex-remote
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -6,11 +6,11 @@
 
 > Orchestrate and command Codex Desktop from QQ and WeChat, with room for Lark, Telegram, and other chat adapters.
 
-**codex-desktop-orchestrator** 是一个本地 Codex Desktop 调度桥接服务。它让你通过 QQ、微信等聊天入口指挥本机 Codex Desktop 执行代码审查、项目分析、测试运行、文件处理和长任务协作。
+**codex-remote** 是一个本地 Codex Desktop 调度桥接服务。它让你通过 QQ、微信等聊天入口指挥本机 Codex Desktop 执行代码审查、项目分析、测试运行、文件处理和长任务协作。
 
-当前包名、主 CLI、runtime 默认目录和文档示例均统一使用 `codex-desktop-orchestrator`。`QQ_CODEX_*` 环境变量表示 QQ 与 Codex 的配置域，仍作为当前配置前缀保留。
+当前包名、主 CLI、runtime 默认目录和文档示例均统一使用 `codex-remote`。`QQ_CODEX_*` 环境变量表示 QQ 与 Codex 的配置域，仍作为当前配置前缀保留。
 
-![codex-desktop-orchestrator README Hero](./output/readme-hero-nanobanana-productized-v1.png)
+![codex-remote README Hero](./output/readme-hero-nanobanana-productized-v1.png)
 
 ## 核心定位
 
@@ -70,7 +70,7 @@ ChatGPT Desktop 相关 adapter 与本地 CLI 代码作为历史遗留的可选 p
 例如：
 
 ```text
-/new codex-desktop-orchestrator 使用 Code Review skill 审查当前未提交更改
+/new codex-remote 使用 Code Review skill 审查当前未提交更改
 ```
 
 ### 查看 Codex 状态
@@ -147,7 +147,7 @@ pnpm start -- init
 如果以后发布为 npm 包，则可以使用：
 
 ```bash
-npx codex-desktop-orchestrator init
+npx codex-remote init
 ```
 
 ### 3. 填写 QQ Bot 凭据
@@ -215,14 +215,14 @@ QQBOT_SHOP_CLIENT_SECRET=Secret2
 ### 项目别名
 
 ```env
-QQ_CODEX_PROJECT_ALIASES_JSON={"codex-desktop-orchestrator":{"cwd":"D:/Project/github/codex-desktop-orchestrator","label":"Codex Desktop Orchestrator"}}
+QQ_CODEX_PROJECT_ALIASES_JSON={"codex-remote":{"cwd":"D:/Project/github/codex-remote","label":"Codex Remote"}}
 ```
 
 配置后可在 QQ 中使用：
 
 ```text
 /aliases
-/new codex-desktop-orchestrator 修复当前 TypeScript 类型错误
+/new codex-remote 修复当前 TypeScript 类型错误
 ```
 
 ### 访问控制
@@ -325,7 +325,7 @@ Codex Desktop threads and tool calls
 
 ```bash
 git clone <你的仓库地址>
-cd codex-desktop-orchestrator
+cd codex-remote
 pnpm install
 cp .env.example .env
 pnpm run build
@@ -355,11 +355,13 @@ pnpm run test:bridge-smoke
 - 本项目会处理聊天消息、附件、语音和本地文件路径，联调时注意隐私边界。
 - 如果把仓库公开，先检查历史提交中是否出现过真实 token 或本地路径。
 
-## 致谢
+## 来源与致谢
 
-本项目是在原项目 `qq-codex-bridge` 基础上进行的二次开发和重新定位，延续并扩展了 QQ Bot 连接 Codex Desktop 的核心思路。
+本项目的起点是社区开源项目 [`qq-codex-bridge`](https://github.com/983033995/qq-codex-bridge)，作者 [983033995](https://github.com/983033995)。QQ 机器人与 Codex Desktop 之间的桥接思路，以及消息收发、媒体处理、会话与线程管理等基础骨架，都由该项目最早建立。
 
-特别感谢原作者 [983033995](https://github.com/983033995) 和原项目为 QQ 与 Codex Desktop 桥接、消息收发、会话管理等能力打下的基础。
+codex-remote 在此基础上重新定位为面向多个聊天入口的本地调度层，新增并重构了 Codex app-server 链路、Turn Manager 状态机、投递重试与恢复、微信文本网关等能力；同时完整保留上游的 MIT 许可与版权声明。
+
+感谢 Codex Desktop 与 QQ 开放平台提供的能力支持，也感谢上游项目及其所有贡献者的工作。
 
 ## License
 

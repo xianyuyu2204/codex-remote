@@ -157,7 +157,7 @@ describe("cli", () => {
     expect(io.stderr.join("\n")).toContain("配置不完整");
     expect(io.stderr.join("\n")).toContain("QQBOT_APP_ID");
     expect(io.stderr.join("\n")).toContain("QQBOT_CLIENT_SECRET");
-    expect(io.stderr.join("\n")).toContain("codex-desktop-orchestrator init");
+    expect(io.stderr.join("\n")).toContain("codex-remote init");
   });
 
   it("prints the new primary CLI name in help", async () => {
@@ -171,7 +171,7 @@ describe("cli", () => {
     ).resolves.toBe(0);
 
     const stdout = io.stdout.join("\n");
-    expect(stdout).toContain("codex-desktop-orchestrator start");
+    expect(stdout).toContain("codex-remote start");
     expect(stdout).not.toContain("兼容别名");
   });
 

@@ -24,7 +24,7 @@ export type RuntimeState = {
 
 export function resolveRuntimeHome(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.QQ_CODEX_RUNTIME_HOME?.trim();
-  const rawHome = configured || path.join(os.homedir(), ".codex-desktop-orchestrator");
+  const rawHome = configured || path.join(os.homedir(), ".codex-remote");
   return path.resolve(expandHome(rawHome));
 }
 

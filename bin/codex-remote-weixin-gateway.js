@@ -4,7 +4,7 @@ import("../dist/apps/weixin-gateway/src/cli.js")
   .then(({ runCliFromProcess }) => runCliFromProcess())
   .catch((error) => {
     console.error(
-      "[codex-desktop-weixin-gateway] fatal:",
+      "[codex-remote-weixin-gateway] fatal:",
       error instanceof Error ? error.message : String(error)
     );
     if (error instanceof Error && error.stack) {

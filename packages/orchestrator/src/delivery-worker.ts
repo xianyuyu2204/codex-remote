@@ -107,7 +107,7 @@ export class DeliveryWorker {
   }
 
   private logError(message: string, error: unknown): void {
-    console.warn(`[codex-desktop-orchestrator] ${message}`, {
+    console.warn(`[codex-remote] ${message}`, {
       error: error instanceof Error ? error.message : String(error)
     });
   }

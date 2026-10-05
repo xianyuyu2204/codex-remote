@@ -967,7 +967,7 @@ describe("BridgeOrchestrator", () => {
       })
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] duplicate inbound suppressed",
+      "[codex-remote] duplicate inbound suppressed",
       expect.objectContaining({
         messageId: secondMessage.messageId,
         sessionKey: secondMessage.sessionKey
@@ -1083,7 +1083,7 @@ describe("BridgeOrchestrator", () => {
     expect(transcriptStore.recordInbound).toHaveBeenNthCalledWith(2, secondMessage);
     expect(conversationProvider.runTurn).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] duplicate inbound suppressed",
+      "[codex-remote] duplicate inbound suppressed",
       expect.objectContaining({
         messageId: repeatedFirstMessage.messageId,
         sessionKey: repeatedFirstMessage.sessionKey
@@ -1349,7 +1349,7 @@ describe("BridgeOrchestrator", () => {
       providerMessageId: null
     });
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] draft delivery failed",
+      "[codex-remote] draft delivery failed",
       expect.objectContaining({
         sessionKey: message.sessionKey,
         messageId: message.messageId,
@@ -1425,7 +1425,7 @@ describe("BridgeOrchestrator", () => {
       })
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] recoverable turn error",
+      "[codex-remote] recoverable turn error",
       expect.objectContaining({
         messageId: message.messageId,
         sessionKey: message.sessionKey,

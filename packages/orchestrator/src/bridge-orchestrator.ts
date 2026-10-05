@@ -78,7 +78,7 @@ export class BridgeOrchestrator {
       }
 
       if (this.isLikelyDuplicateInbound(message)) {
-        console.warn("[codex-desktop-orchestrator] duplicate inbound suppressed", {
+        console.warn("[codex-remote] duplicate inbound suppressed", {
           messageId: message.messageId,
           sessionKey: message.sessionKey
         });
@@ -190,7 +190,7 @@ export class BridgeOrchestrator {
             } catch (error) {
               const reason = error instanceof Error ? error.message : String(error);
               deliveryErrors.push(`${pendingDraft.draftId}: ${reason}`);
-              console.warn("[codex-desktop-orchestrator] draft delivery failed", {
+              console.warn("[codex-remote] draft delivery failed", {
                 sessionKey: message.sessionKey,
                 messageId: message.messageId,
                 draftId: pendingDraft.draftId,
@@ -246,7 +246,7 @@ export class BridgeOrchestrator {
                   "任务仍在运行，完成后会一次性回复。"
                 );
               }).catch((error) => {
-                console.warn("[codex-desktop-orchestrator] task heartbeat failed", {
+                console.warn("[codex-remote] task heartbeat failed", {
                   messageId: message.messageId,
                   sessionKey: message.sessionKey,
                   error: error instanceof Error ? error.message : String(error)
@@ -313,7 +313,7 @@ export class BridgeOrchestrator {
               try {
                 return await this.deps.interruptTurn?.(message.sessionKey) ?? false;
               } catch (interruptError) {
-                console.warn("[codex-desktop-orchestrator] hard timeout interrupt failed", {
+                console.warn("[codex-remote] hard timeout interrupt failed", {
                   messageId: message.messageId,
                   sessionKey: message.sessionKey,
                   error: interruptError instanceof Error
@@ -367,7 +367,7 @@ export class BridgeOrchestrator {
               BridgeSessionStatus.Active,
               lastError
             );
-            console.warn("[codex-desktop-orchestrator] recoverable turn error", {
+            console.warn("[codex-remote] recoverable turn error", {
               messageId: message.messageId,
               sessionKey: message.sessionKey,
               error: lastError

@@ -11,7 +11,7 @@ async function runDev() {
     startupPollIntervalMs: Number(process.env.CODEX_CDP_POLL_INTERVAL_MS ?? "500")
   });
 
-  console.log("[codex-desktop-orchestrator] codex desktop ready", {
+  console.log("[codex-remote] codex desktop ready", {
     launched: result.launched,
     remoteDebuggingPort: config.codexDesktop.remoteDebuggingPort
   });
@@ -22,7 +22,7 @@ async function runDev() {
 
 runDev().catch((error) => {
   const cause = error instanceof Error ? error.cause : undefined;
-  console.error("[codex-desktop-orchestrator] fatal:", error instanceof Error ? error.message : String(error));
+  console.error("[codex-remote] fatal:", error instanceof Error ? error.message : String(error));
   if (cause !== undefined) {
     console.error("  caused by:", cause);
   }

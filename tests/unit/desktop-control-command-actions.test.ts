@@ -18,7 +18,7 @@ function createControlState(overrides: Partial<CodexControlState> = {}): CodexCo
     threadRelativeTime: null,
     model: "GPT-5.4",
     reasoningEffort: "高",
-    workspace: "codex-desktop-orchestrator",
+    workspace: "codex-remote",
     branch: "codex/weixin-multi-channel",
     permissionMode: "完全访问权限",
     quotaSummary: null,
@@ -73,7 +73,7 @@ describe("DesktopControlCommandActions", () => {
       [
         "当前模型：GPT-5.4",
         "推理强度：高",
-        "工作区：codex-desktop-orchestrator",
+        "工作区：codex-remote",
         "分支：codex/weixin-multi-channel"
       ].join("\n")
     );
@@ -143,7 +143,7 @@ describe("DesktopControlCommandActions", () => {
         createControlState({
           threadRef: "codex-app-thread:thread-b:fresh-title",
           threadTitle: "线程 B",
-          threadProjectName: "codex-desktop-orchestrator",
+          threadProjectName: "codex-remote",
           threadRelativeTime: "刚刚"
         })
       ),
@@ -159,11 +159,11 @@ describe("DesktopControlCommandActions", () => {
         "当前运行状态：",
         "线程绑定：codex-app-thread:thread-b:fresh-title",
         "线程标题：线程 B",
-        "线程项目：codex-desktop-orchestrator",
+        "线程项目：codex-remote",
         "线程最近活动：刚刚",
         "模型：GPT-5.4",
         "推理强度：高",
-        "工作区：codex-desktop-orchestrator",
+        "工作区：codex-remote",
         "分支：codex/weixin-multi-channel",
         "权限：完全访问权限",
         "额度：5 小时 22%（01:56 重置）"

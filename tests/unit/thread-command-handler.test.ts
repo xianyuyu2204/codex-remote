@@ -167,7 +167,7 @@ function createDriver(
       model: "GPT-5.4",
       reasoningEffort: "高",
       workspace: "本地",
-      branch: "codex/codex-desktop-orchestrator",
+      branch: "codex/codex-remote",
       permissionMode: "完全访问权限",
       quotaSummary: null
     }),
@@ -175,7 +175,7 @@ function createDriver(
       model: "GPT-5.4",
       reasoningEffort: "高",
       workspace: "本地",
-      branch: "codex/codex-desktop-orchestrator",
+      branch: "codex/codex-remote",
       permissionMode: "完全访问权限",
       quotaSummary: null
     }),
@@ -912,7 +912,7 @@ describe("thread command handler", () => {
 
     expect(retryInbound).toHaveBeenCalledOnce();
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] retry acknowledgement delivery failed",
+      "[codex-remote] retry acknowledgement delivery failed",
       expect.objectContaining({
         sourceTurnId: "bridge-turn-failed-2",
         error: "qq unavailable"
@@ -997,7 +997,7 @@ describe("thread command handler", () => {
         model: "GPT-5.4",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/codex-desktop-orchestrator",
+        branch: "codex/codex-remote",
         permissionMode: "完全访问权限",
         quotaSummary: null
       })
@@ -1034,7 +1034,7 @@ describe("thread command handler", () => {
         model: "GPT-5.4-Mini",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/codex-desktop-orchestrator",
+        branch: "codex/codex-remote",
         permissionMode: "完全访问权限",
         quotaSummary: null
       })
@@ -1067,7 +1067,7 @@ describe("thread command handler", () => {
         model: "GPT-5.4",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/codex-desktop-orchestrator",
+        branch: "codex/codex-remote",
         permissionMode: "完全访问权限",
         quotaSummary: null
       }),
@@ -1113,11 +1113,11 @@ describe("thread command handler", () => {
     const getControlState = vi.fn().mockResolvedValue({
       threadRef: "codex-app-thread:thread-b:fresh-title",
       threadTitle: "线程 B",
-      threadProjectName: "codex-desktop-orchestrator",
+      threadProjectName: "codex-remote",
       threadRelativeTime: "刚刚",
       model: "GPT-5.4",
       reasoningEffort: "高",
-      workspace: "codex-desktop-orchestrator",
+      workspace: "codex-remote",
       branch: "codex/weixin-multi-channel",
       permissionMode: "完全访问权限",
       quotaSummary: null
@@ -1153,7 +1153,7 @@ describe("thread command handler", () => {
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("工作区：codex-desktop-orchestrator")
+        text: expect.stringContaining("工作区：codex-remote")
       })
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
@@ -1555,7 +1555,7 @@ describe("thread command handler", () => {
       qqEgress,
       projectAliases: {
         bridge: {
-          cwd: "D:/Project/github/codex-desktop-orchestrator",
+          cwd: "D:/Project/github/codex-remote",
           label: "Bridge"
         }
       }
@@ -1571,7 +1571,7 @@ describe("thread command handler", () => {
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("| bridge | Bridge | D:/Project/github/codex-desktop-orchestrator |")
+        text: expect.stringContaining("| bridge | Bridge | D:/Project/github/codex-remote |")
       })
     );
   });
@@ -1587,20 +1587,20 @@ describe("thread command handler", () => {
       desktopDriver,
       qqEgress,
       projectAliases: {
-        "codex-desktop-orchestrator": {
-          cwd: "D:/Project/github/codex-desktop-orchestrator",
-          label: "Codex Desktop Orchestrator"
+        "codex-remote": {
+          cwd: "D:/Project/github/codex-remote",
+          label: "Codex Remote"
         }
       }
     });
 
-    await expect(handler.handleIfCommand(createPrivateMessage("/new codex-desktop-orchestrator fix startup"))).resolves.toBe(true);
+    await expect(handler.handleIfCommand(createPrivateMessage("/new codex-remote fix startup"))).resolves.toBe(true);
 
     expect(desktopDriver.createThread).toHaveBeenCalledWith(
       "qqbot:default::qq:c2c:OPENID123",
       expect.stringContaining("fix startup"),
       {
-        cwd: "D:/Project/github/codex-desktop-orchestrator"
+        cwd: "D:/Project/github/codex-remote"
       }
     );
     expect(sessionStore.updateConversationProvider).toHaveBeenCalledWith(
@@ -1622,7 +1622,7 @@ describe("thread command handler", () => {
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("Created Codex thread for project: Codex Desktop Orchestrator")
+        text: expect.stringContaining("Created Codex thread for project: Codex Remote")
       })
     );
   });
@@ -1639,7 +1639,7 @@ describe("thread command handler", () => {
       qqEgress,
       projectAliases: {
         bridge: {
-          cwd: "D:/Project/github/codex-desktop-orchestrator"
+          cwd: "D:/Project/github/codex-remote"
         }
       }
     });

@@ -288,9 +288,9 @@ describe("bridge config", () => {
           clientSecret: "config-secret"
         },
         projectAliases: {
-          "codex-desktop-orchestrator": {
-            cwd: "D:/Project/github/codex-desktop-orchestrator",
-            label: "Codex Desktop Orchestrator"
+          "codex-remote": {
+            cwd: "D:/Project/github/codex-remote",
+            label: "Codex Remote"
           }
         }
       })
@@ -301,9 +301,9 @@ describe("bridge config", () => {
     });
 
     expect(config.projectAliases).toEqual({
-      "codex-desktop-orchestrator": {
-        cwd: "D:/Project/github/codex-desktop-orchestrator",
-        label: "Codex Desktop Orchestrator"
+      "codex-remote": {
+        cwd: "D:/Project/github/codex-remote",
+        label: "Codex Remote"
       }
     });
   });
@@ -314,7 +314,7 @@ describe("bridge config", () => {
       QQBOT_CLIENT_SECRET: "qq-secret",
       QQ_CODEX_PROJECT_ALIASES_JSON: JSON.stringify({
         bridge: {
-          path: "D:/Project/github/codex-desktop-orchestrator",
+          path: "D:/Project/github/codex-remote",
           label: "Bridge"
         }
       })
@@ -322,7 +322,7 @@ describe("bridge config", () => {
 
     expect(config.projectAliases).toEqual({
       bridge: {
-        cwd: "D:/Project/github/codex-desktop-orchestrator",
+        cwd: "D:/Project/github/codex-remote",
         label: "Bridge"
       }
     });

@@ -32,7 +32,7 @@ const REQUIRED_ENV_MAP: Record<string, string> = {
   "codexDesktop.appName": "CODEX_APP_NAME",
   "codexDesktop.remoteDebuggingPort": "CODEX_REMOTE_DEBUGGING_PORT"
 };
-const CLI_NAME = "codex-desktop-orchestrator";
+const CLI_NAME = "codex-remote";
 const LOG_PREFIX = `[${CLI_NAME}]`;
 
 export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<number> {
@@ -294,7 +294,7 @@ function defaultRuntimeConfigTemplate(cwd: string) {
   const aliasName = path.basename(resolvedCwd) || "project";
   return {
     version: 1,
-    databasePath: "runtime/codex-desktop-orchestrator.sqlite",
+    databasePath: "runtime/codex-remote.sqlite",
     runtime: {
       listenHost: "127.0.0.1",
       listenPort: 3100,

@@ -28,8 +28,8 @@
 
 ### Changed
 
-- 项目定位与发布元数据迁移为 `codex-desktop-orchestrator`。
-- 移除旧仓库名 CLI 别名和旧 runtime 默认命名，统一使用 `codex-desktop-orchestrator`。
+- 项目定位与发布元数据迁移为 `codex-remote`。
+- 移除旧仓库名 CLI 别名和旧 runtime 默认命名，统一使用 `codex-remote`。
 - 新项目版本从 `0.0.1` 起步，不沿用原项目 `0.1.4` 版本号。
 - ChatGPT Desktop 相关能力作为历史遗留的可选 provider 保留，当前主定位聚焦 Codex Desktop 调度。
 

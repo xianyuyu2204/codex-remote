@@ -417,7 +417,7 @@ export class ThreadCommandHandler {
         `Retry queued from task: ${result.sourceTurnId}`
       );
     } catch (error) {
-      console.warn("[codex-desktop-orchestrator] retry acknowledgement delivery failed", {
+      console.warn("[codex-remote] retry acknowledgement delivery failed", {
         sourceTurnId: result.sourceTurnId,
         messageId: message.messageId,
         error: error instanceof Error ? error.message : String(error)

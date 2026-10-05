@@ -36,7 +36,7 @@ describe("sqlite store", () => {
   });
 
   function createTempDbPath(): string {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "codex-desktop-orchestrator-"));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "codex-remote-"));
     tempDirs.push(dir);
     return path.join(dir, "data", "bridge.sqlite");
   }
@@ -1023,7 +1023,7 @@ describe("sqlite store", () => {
     await expect(secondWork).resolves.toBeUndefined();
     expect(secondEntered).toEqual(["entered"]);
     expect(warnSpy).toHaveBeenCalledWith(
-      "[codex-desktop-orchestrator] thread queue notice failed",
+      "[codex-remote] thread queue notice failed",
       expect.objectContaining({
         threadRef,
         error: "queue notice failed"

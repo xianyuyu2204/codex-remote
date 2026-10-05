@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const DEFAULT_REGISTRY_PATH = join(
   homedir(),
-  ".codex-desktop-orchestrator",
+  ".codex-remote",
   "chatgpt-session-registry.json"
 );
 

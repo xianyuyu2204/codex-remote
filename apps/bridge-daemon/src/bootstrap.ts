@@ -152,7 +152,7 @@ export function bootstrap() {
       try {
         await options?.onQueued?.();
       } catch (error) {
-        console.warn("[codex-desktop-orchestrator] desktop queue notice failed", {
+        console.warn("[codex-remote] desktop queue notice failed", {
           error: error instanceof Error ? error.message : String(error)
         });
       }
@@ -453,7 +453,7 @@ async function postTurnEvent(port: number, event: TurnEvent): Promise<void> {
       body: JSON.stringify(event)
     });
   } catch (error) {
-    console.warn("[codex-desktop-orchestrator] turn event callback failed", {
+    console.warn("[codex-remote] turn event callback failed", {
       turnId: event.turnId,
       sessionKey: event.sessionKey,
       error: error instanceof Error ? error.message : String(error)

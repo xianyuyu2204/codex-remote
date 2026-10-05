@@ -1,15 +1,15 @@
 {
-  "name": "codex-desktop-orchestrator",
+  "name": "codex-remote",
   "version": "0.0.1",
   "description": "Orchestrate and command Codex Desktop from QQ and WeChat, with room for Lark and Telegram adapters.",
   "type": "module",
-  "homepage": "https://github.com/xxloocee/codex-desktop-orchestrator",
+  "homepage": "https://github.com/xianyuyu2204/codex-remote",
   "bugs": {
-    "url": "https://github.com/xxloocee/codex-desktop-orchestrator/issues"
+    "url": "https://github.com/xianyuyu2204/codex-remote/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xxloocee/codex-desktop-orchestrator.git"
+    "url": "git+https://github.com/xianyuyu2204/codex-remote.git"
   },
   "keywords": [
     "bridge",
@@ -26,8 +26,8 @@
     "typescript"
   ],
   "bin": {
-    "codex-desktop-orchestrator": "bin/codex-desktop-orchestrator.js",
-    "codex-desktop-weixin-gateway": "bin/codex-desktop-weixin-gateway.js"
+    "codex-remote": "bin/codex-remote.js",
+    "codex-remote-weixin-gateway": "bin/codex-remote-weixin-gateway.js"
   },
   "files": [
     "bin",

@@ -67,7 +67,7 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
       await deps.orchestrator.handleInbound(message);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error("[codex-desktop-orchestrator] message handling failed", {
+      console.error("[codex-remote] message handling failed", {
         messageId: message.messageId,
         sessionKey: message.sessionKey,
         error: errorMessage
@@ -89,7 +89,7 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
           await markSynchronousDeliveryResult(deps.deliveryJobStore, errorDraft, delivery);
         } catch (replyError) {
           await markSynchronousDeliveryFailure(deps.deliveryJobStore, errorDraft, replyError);
-          console.warn("[codex-desktop-orchestrator] failed to send error reply", {
+          console.warn("[codex-remote] failed to send error reply", {
             replyError: replyError instanceof Error ? replyError.message : String(replyError)
           });
         }
@@ -328,7 +328,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
         await resolveTurnEventOrchestrator(event, app.orchestrators).handleTurnEvent(event);
       },
       onDispatchError: (error, payload) => {
-        console.warn("[codex-desktop-orchestrator] internal turn event dispatch failed", {
+        console.warn("[codex-remote] internal turn event dispatch failed", {
           error: error.message,
           payload
         });
@@ -341,7 +341,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
         await route.ingressHandler(message);
       },
       onDispatchError: (error: Error, payload: unknown) => {
-        console.warn("[codex-desktop-orchestrator] weixin webhook dispatch failed", {
+        console.warn("[codex-remote] weixin webhook dispatch failed", {
           accountKey: route.accountKey,
           error: error.message,
           payload
@@ -353,7 +353,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   function logRejectedInbound(message: InboundMessage, decision: AccessDecision): void {
     const summary = `rejected account=${message.accountKey} chatType=${message.chatType} sender=${message.senderId} peer=${message.peerKey} reason=${decision.reason}`;
     appendRuntimeLog(paths, summary);
-    console.warn("[codex-desktop-orchestrator] inbound rejected by access control", {
+    console.warn("[codex-remote] inbound rejected by access control", {
       accountKey: message.accountKey,
       chatType: message.chatType,
       senderId: message.senderId,
@@ -372,7 +372,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
 
   if (qqGatewayDisabled) {
     appendRuntimeLog(paths, "qq gateway disabled by QQ_CODEX_DISABLE_QQ_GATEWAY");
-    console.warn("[codex-desktop-orchestrator] qq gateway disabled by QQ_CODEX_DISABLE_QQ_GATEWAY");
+    console.warn("[codex-remote] qq gateway disabled by QQ_CODEX_DISABLE_QQ_GATEWAY");
   } else {
     for (const entry of qqIngressHandlers) {
       await entry.adapter.ingress.onMessage(entry.ingressHandler);
@@ -385,7 +385,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     const weixinService = await startWeixinGatewayService();
     managedServices.push(weixinService);
     channelSet.add(`weixin:${weixinService.status.accountId}`);
-    console.log("[codex-desktop-orchestrator] channel ready", {
+    console.log("[codex-remote] channel ready", {
       channel: "weixin",
       listenHost: weixinService.status.listenHost,
       listenPort: weixinService.status.listenPort,
@@ -407,7 +407,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     version: process.env.npm_package_version ?? "unknown"
   });
 
-  console.log("[codex-desktop-orchestrator] ready", {
+  console.log("[codex-remote] ready", {
     transport: "qq-gateway-websocket",
     accountKeys: channels,
     conversationProvider: app.config.conversationProvider,
@@ -512,7 +512,7 @@ function redactConfig<T>(value: T): T {
 
 function handleFatal(error: unknown) {
   const cause = error instanceof Error ? error.cause : undefined;
-  console.error("[codex-desktop-orchestrator] fatal:", error instanceof Error ? error.message : String(error));
+  console.error("[codex-remote] fatal:", error instanceof Error ? error.message : String(error));
   if (cause !== undefined) {
     console.error("  caused by:", cause);
   }

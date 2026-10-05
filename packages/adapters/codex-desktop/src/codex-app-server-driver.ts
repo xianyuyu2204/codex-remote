@@ -31,8 +31,8 @@ import {
 const APP_THREAD_REF_PREFIX = "codex-app-thread:";
 const LEGACY_THREAD_REF_PREFIX = "codex-thread:";
 const CLIENT_INFO = {
-  name: "codex-desktop-orchestrator",
-  title: "Codex Desktop Orchestrator",
+  name: "codex-remote",
+  title: "Codex Remote",
   version: "0.0.1"
 };
 
@@ -691,7 +691,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       const normalized = error instanceof Error ? error : new Error(String(error));
       this.managedAppServerStartError = normalized;
       this.appServerUrl = url;
-      console.error("[codex-desktop-orchestrator] codex app-server failed to start", {
+      console.error("[codex-remote] codex app-server failed to start", {
         binary: this.codexBinaryPath,
         error: normalized.message
       });
@@ -709,7 +709,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       this.socket = null;
       this.initialized = false;
       this.appServerUrl = null;
-      console.error("[codex-desktop-orchestrator] codex app-server failed to start", {
+      console.error("[codex-remote] codex app-server failed to start", {
         binary: this.codexBinaryPath,
         error: error.message
       });
@@ -720,11 +720,11 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     this.child.stdout?.on("data", (chunk) => {
       const text = String(chunk).trim();
       if (text) {
-        console.info("[codex-desktop-orchestrator] codex app-server", { text });
+        console.info("[codex-remote] codex app-server", { text });
       }
     });
     this.appServerUrl = url;
-    console.info("[codex-desktop-orchestrator] codex app-server starting", {
+    console.info("[codex-remote] codex app-server starting", {
       url,
       binary: this.codexBinaryPath
     });
@@ -737,7 +737,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       return;
     }
 
-    console.warn("[codex-desktop-orchestrator] codex app-server stderr", { text });
+    console.warn("[codex-remote] codex app-server stderr", { text });
   }
 
   private async openSocket(url: string): Promise<void> {
@@ -769,7 +769,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       this.pendingRequests.clear();
     });
     socket.on("error", (error) => {
-      console.warn("[codex-desktop-orchestrator] codex app-server websocket error", {
+      console.warn("[codex-remote] codex app-server websocket error", {
         error: error.message
       });
     });
@@ -836,7 +836,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
         id: message.id,
         error: {
           code: -32601,
-          message: "codex-desktop-orchestrator does not handle server requests yet"
+          message: "codex-remote does not handle server requests yet"
         }
       }));
       return;
@@ -870,7 +870,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     if (method === "turn/completed") {
       void this.handleTurnCompleted(params as TurnCompletedParams).catch((error) => {
-        console.warn("[codex-desktop-orchestrator] turn completion handling failed", {
+        console.warn("[codex-remote] turn completion handling failed", {
           error: error instanceof Error ? error.message : String(error)
         });
       });
@@ -1215,7 +1215,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     try {
       await onTurnEvent(event);
     } catch (error) {
-      console.warn("[codex-desktop-orchestrator] codex app-server turn event callback failed", {
+      console.warn("[codex-remote] codex app-server turn event callback failed", {
         sessionKey: event.sessionKey,
         turnId: event.turnId,
         error: error instanceof Error ? error.message : String(error)
@@ -1263,7 +1263,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       return;
     }
     this.lastNotificationForwardErrorAt = now;
-    console.warn("[codex-desktop-orchestrator] codex app ui notification forward failed", {
+    console.warn("[codex-remote] codex app ui notification forward failed", {
       error: error instanceof Error ? error.message : String(error)
     });
   }
@@ -1316,7 +1316,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     for (const turn of staleTurns) {
       await this.interruptTurn(threadId, turn.id!).catch((error) => {
-        console.warn("[codex-desktop-orchestrator] codex stale turn interrupt failed", {
+        console.warn("[codex-remote] codex stale turn interrupt failed", {
           threadId,
           turnId: turn.id,
           error: error instanceof Error ? error.message : String(error)

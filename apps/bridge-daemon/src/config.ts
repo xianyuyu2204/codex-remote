@@ -170,7 +170,7 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): AppConfig {
   };
 
   return appConfigSchema.parse({
-    databasePath: env.QQ_CODEX_DATABASE_PATH ?? "runtime/codex-desktop-orchestrator.sqlite",
+    databasePath: env.QQ_CODEX_DATABASE_PATH ?? "runtime/codex-remote.sqlite",
     runtime: {
       listenHost: env.QQ_CODEX_LISTEN_HOST ?? "127.0.0.1",
       listenPort: Number(env.QQ_CODEX_LISTEN_PORT ?? "3100"),
@@ -223,7 +223,7 @@ function loadConfigFromEnvOrDefaults(env: NodeJS.ProcessEnv): AppConfig {
     };
 
     return {
-      databasePath: env.QQ_CODEX_DATABASE_PATH ?? "runtime/codex-desktop-orchestrator.sqlite",
+      databasePath: env.QQ_CODEX_DATABASE_PATH ?? "runtime/codex-remote.sqlite",
       runtime: {
         listenHost: env.QQ_CODEX_LISTEN_HOST ?? "127.0.0.1",
         listenPort: Number(env.QQ_CODEX_LISTEN_PORT ?? "3100"),
